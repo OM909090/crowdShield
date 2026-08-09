@@ -1,21 +1,77 @@
+import { useEffect, useState } from "react";
+import { useParams, useNavigate } from "react-router-dom";
 import { motion } from "framer-motion";
-import { MapPinned, Radar, Activity, Wifi, ShieldAlert } from "lucide-react";
-import CrowdMap from "../components/CrowdMap";
+import { MapPinned, Radar, Activity, Wifi, ShieldAlert, ArrowLeft } from "lucide-react";
+import toast from "react-hot-toast";
+import api from "../utils/axios";
+import VenueMap from "../components/VenueMap";
 
-const metrics = [
-  { label: "Active zones", value: "12", icon: Radar },
-  { label: "Risk hotspots", value: "03", icon: ShieldAlert },
-  { label: "Live feeds", value: "24/7", icon: Wifi },
-  { label: "Movement pace", value: "Stable", icon: Activity },
-];
+// Fallback center used only when an event has no saved coordinates yet.
+const DEFAULT_CENTER = [20.2961, 85.8245]; // Bhubaneswar, Odisha
 
 export default function LiveMap() {
+  const { id } = useParams();
+  const navigate = useNavigate();
+  const [event, setEvent] = useState(null);
+  const [markers, setMarkers] = useState([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    const load = async () => {
+      try {
+        setLoading(true);
+        const [eventRes, markersRes] = await Promise.all([
+          api.get(`/events/${id}`),
+          api.get(`/events/${id}/markers`),
+        ]);
+        setEvent(eventRes.data.event);
+        setMarkers(markersRes.data.markers);
+      } catch (err) {
+        toast.error(err.response?.data?.message || "Failed to load map");
+      } finally {
+        setLoading(false);
+      }
+    };
+    load();
+  }, [id]);
+
+  const center = event?.location?.coordinates?.coordinates
+    ? [event.location.coordinates.coordinates[1], event.location.coordinates.coordinates[0]]
+    : DEFAULT_CENTER;
+
+  const blockages = markers.filter((m) => ["Barricade", "Blocked Path"].includes(m.type)).length;
+
+  const metrics = [
+    { label: "Marked zones", value: String(markers.length).padStart(2, "0"), icon: Radar },
+    { label: "Blockages flagged", value: String(blockages).padStart(2, "0"), icon: ShieldAlert },
+    { label: "Live feeds", value: "24/7", icon: Wifi },
+    { label: "Movement pace", value: "Stable", icon: Activity },
+  ];
+
+  if (loading) {
+    return (
+      <div className="flex min-h-[85vh] items-center justify-center text-slate-400">
+        <motion.div animate={{ rotate: 360 }} transition={{ duration: 1.1, repeat: Infinity, ease: "linear" }}>
+          <Radar className="h-8 w-8 text-cyan-400" />
+        </motion.div>
+      </div>
+    );
+  }
+
   return (
     <div className="relative min-h-[85vh] overflow-hidden text-white">
       <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_top_left,_rgba(34,211,238,0.18),_transparent_30%),radial-gradient(circle_at_bottom_right,_rgba(59,130,246,0.14),_transparent_28%)]" />
       <div className="pointer-events-none absolute inset-0 bg-[linear-gradient(to_right,rgba(255,255,255,0.03)_1px,transparent_1px),linear-gradient(to_bottom,rgba(255,255,255,0.03)_1px,transparent_1px)] bg-[size:72px_72px] opacity-20" />
 
       <div className="relative space-y-6">
+        <button
+          onClick={() => navigate("/events")}
+          className="inline-flex items-center gap-1.5 text-sm text-slate-400 transition hover:text-cyan-300"
+        >
+          <ArrowLeft size={15} />
+          Back to events
+        </button>
+
         <motion.div
           initial={{ opacity: 0, y: -15 }}
           animate={{ opacity: 1, y: 0 }}
@@ -27,11 +83,10 @@ export default function LiveMap() {
               <MapPinned className="h-4 w-4" />
               Real-time venue intelligence
             </div>
-            <h1 className="text-3xl font-black tracking-tight sm:text-4xl lg:text-5xl">
-              Live Crowd Monitoring Map
-            </h1>
+            <h1 className="text-3xl font-black tracking-tight sm:text-4xl lg:text-5xl">{event?.name}</h1>
             <p className="mt-3 max-w-2xl text-sm leading-6 text-slate-400 sm:text-base">
-              Track density buildup, bottlenecks, and risk zones across the venue in real time.
+              Track authority-marked safe zones, barricades, and blocked paths across{" "}
+              {event?.location?.venueName} in real time.
             </p>
           </div>
 
@@ -45,9 +100,7 @@ export default function LiveMap() {
                 >
                   <div className="mb-2 flex items-center gap-2 text-cyan-300">
                     <Icon className="h-4 w-4" />
-                    <span className="text-[11px] uppercase tracking-[0.28em] text-slate-400">
-                      {item.label}
-                    </span>
+                    <span className="text-[11px] uppercase tracking-[0.28em] text-slate-400">{item.label}</span>
                   </div>
                   <p className="text-lg font-bold text-white">{item.value}</p>
                 </div>
@@ -72,9 +125,7 @@ export default function LiveMap() {
                 </div>
                 <div>
                   <p className="text-sm font-semibold text-white">Live Monitoring Layer</p>
-                  <p className="text-xs text-slate-400">
-                    Heatmaps, movement trails, and alert overlays
-                  </p>
+                  <p className="text-xs text-slate-400">Authority-marked zones and blockages</p>
                 </div>
               </div>
 
@@ -86,7 +137,12 @@ export default function LiveMap() {
           </div>
 
           <div className="h-[60vh] min-h-[500px] lg:h-[700px]">
-            <CrowdMap />
+            <VenueMap
+              center={center}
+              venue={{ name: event?.location?.venueName, address: event?.location?.address }}
+              markers={markers}
+              editable={false}
+            />
           </div>
         </motion.div>
       </div>

@@ -1,14 +1,9 @@
-import {
-Routes,
-Route
-} from "react-router-dom";
-
+import { Routes, Route } from "react-router-dom";
 
 import Landing from "../pages/Landing";
 import Login from "../pages/Login";
 import Signup from "../pages/Signup";
 import Dashboard from "../pages/Dashboard";
-
 
 import DashboardLayout from "../layouts/DashboardLayout";
 import LiveMap from "../pages/LiveMap";
@@ -20,107 +15,154 @@ import DigitalTwin from "../pages/DigitalTwin";
 import AIAssistant from "../pages/AIAssistant";
 import IncidentSummary from "../pages/IncidentSummary";
 import CrowdMonitoring from "../pages/CrowdMonitoring";
-import Analytics from "../pages/Analytics";
+import Analytics from "../pages/authority/Analytics";
 import EventSelection from "../pages/EventsSelection";
-import CreateEvent from "../pages/CreateEvent";
-import AdminVerification from "../pages/AdminVerification";
+import CreateEvent from "../pages/authority/CreateEvent";
+import AdminVerification from "../pages/admin/AdminVerification";
+import CommandCenter from "../pages/authority/CommandCenter";
+import MapEditor from "../pages/authority/MapEditor";
 
+import ProtectedRoute from "../components/ProtectedRoute";
 
-export default function AppRoutes(){
+const ANY_AUTH = ["citizen", "authority", "admin"];
 
+export default function AppRoutes() {
+  return (
+    <Routes>
+      <Route path="/" element={<Landing />} />
+      <Route path="/login" element={<Login />} />
+      <Route path="/signup" element={<Signup />} />
 
-return(
+      <Route element={<DashboardLayout />}>
+        <Route
+          path="/dashboard"
+          element={
+            <ProtectedRoute roles={ANY_AUTH}>
+              <Dashboard />
+            </ProtectedRoute>
+          }
+        />
+      </Route>
 
-<Routes>
+      {/* Citizen-facing, event-scoped (open to any logged-in role) */}
+      <Route
+        path="/events"
+        element={
+          <ProtectedRoute roles={ANY_AUTH}>
+            <EventSelection />
+          </ProtectedRoute>
+        }
+      />
+      <Route
+        path="/events/:id/dashboard"
+        element={
+          <ProtectedRoute roles={ANY_AUTH}>
+            <CrowdMonitoring />
+          </ProtectedRoute>
+        }
+      />
+      <Route
+        path="/events/:id/map"
+        element={
+          <ProtectedRoute roles={ANY_AUTH}>
+            <LiveMap />
+          </ProtectedRoute>
+        }
+      />
 
+      {/* Standalone pages not yet event-scoped — left open to any logged-in role, adjust as needed */}
+      <Route
+        path="/risk"
+        element={
+          <ProtectedRoute roles={ANY_AUTH}>
+            <RiskPrediction />
+          </ProtectedRoute>
+        }
+      />
+      <Route
+        path="/recommendations"
+        element={
+          <ProtectedRoute roles={ANY_AUTH}>
+            <Recommendations />
+          </ProtectedRoute>
+        }
+      />
+      <Route
+        path="/citizen"
+        element={
+          <ProtectedRoute roles={ANY_AUTH}>
+            <CitizenApp />
+          </ProtectedRoute>
+        }
+      />
+      <Route
+        path="/digital-twin"
+        element={
+          <ProtectedRoute roles={ANY_AUTH}>
+            <DigitalTwin />
+          </ProtectedRoute>
+        }
+      />
+      <Route
+        path="/ai-assistant"
+        element={
+          <ProtectedRoute roles={ANY_AUTH}>
+            <AIAssistant />
+          </ProtectedRoute>
+        }
+      />
+      <Route
+        path="/incident"
+        element={
+          <ProtectedRoute roles={ANY_AUTH}>
+            <IncidentSummary />
+          </ProtectedRoute>
+        }
+      />
 
-<Route path="/" element={<Landing/>}/>
+      {/* Authority only */}
+      <Route
+        path="/authority/events"
+        element={
+          <ProtectedRoute roles={["authority"]}>
+            <CreateEvent />
+          </ProtectedRoute>
+        }
+      />
+      <Route
+        path="/authority/events/:id/command-center"
+        element={
+          <ProtectedRoute roles={["authority"]}>
+            <CommandCenter />
+          </ProtectedRoute>
+        }
+      />
+      <Route
+        path="/authority/events/:id/analytics"
+        element={
+          <ProtectedRoute roles={["authority"]}>
+            <Analytics />
+          </ProtectedRoute>
+        }
+      />
+      <Route
+        path="/authority/events/:id/map"
+        element={
+          <ProtectedRoute roles={["authority"]}>
+            <MapEditor />
+          </ProtectedRoute>
+        }
+      />
 
-<Route path="/login" element={<Login/>}/>
-
-<Route path="/signup" element={<Signup/>}/>
-
-
-
-<Route element={<DashboardLayout/>}>
-
-<Route 
-path="/dashboard"
-element={<Dashboard/>}
-/>
-
-</Route>
-
-<Route
-path="/map"
-element={<LiveMap />}
-/>
-
-<Route
-path="/risk"
-element={<RiskPrediction />}
-/>
-
-<Route
-
-path="/recommendations"
-
-element={<Recommendations />}
-
-/>
-
-<Route
-
-path="/citizen"
-
-element={<CitizenApp />}
-
-/>
-
-<Route
-path="/digital-twin"
-element={<DigitalTwin/>}
-/>
-
-
-<Route
-path="/ai-assistant"
-element={<AIAssistant/>}
-/>
-
-
-<Route
-path="/incident"
-element={<IncidentSummary/>}
-/>
-
-<Route
-path="/crowd"
-element={<CrowdMonitoring />}
-/>
-
-<Route
-path="/analytics"
-element={<Analytics />}
-/>
-
-<Route
-path="/events"
-element={<EventSelection />}
-/>
-
-<Route
-path="/authority/events"
-element={<CreateEvent />}
-/>
-
-<Route
-path="/admin/verify-authorities"
-element={<AdminVerification />}
-/>
-
-</Routes>
-
-)
-
+      {/* Admin only */}
+      <Route
+        path="/admin/verify-authorities"
+        element={
+          <ProtectedRoute roles={["admin"]}>
+            <AdminVerification />
+          </ProtectedRoute>
+        }
+      />
+    </Routes>
+  );
 }

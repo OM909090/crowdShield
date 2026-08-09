@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { useNavigate } from "react-router-dom";
 import { useForm } from "react-hook-form";
 import { motion, AnimatePresence } from "framer-motion";
 import toast from "react-hot-toast";
@@ -20,8 +21,11 @@ import {
   Trash2,
   CalendarDays,
   ShieldAlert,
+  Radar,
+  MapPinned,
+  BarChart3,
 } from "lucide-react";
-import api from "../utils/axios";
+import api from "../../utils/axios";
 
 const TYPES = [
   { value: "Festival", icon: PartyPopper },
@@ -43,6 +47,7 @@ const inputClass =
   "w-full rounded-2xl border border-white/10 bg-slate-950/60 px-4 py-3 text-sm text-white outline-none transition placeholder:text-slate-500 focus:border-cyan-400/50 focus:bg-slate-950";
 
 export default function CreateEvent() {
+  const navigate = useNavigate();
   const [myEvents, setMyEvents] = useState([]);
   const [loadingEvents, setLoadingEvents] = useState(true);
   const [coords, setCoords] = useState(null);
@@ -396,13 +401,36 @@ export default function CreateEvent() {
                             {event.location?.venueName}
                           </p>
                         </div>
-                        <button
-                          onClick={() => deleteEvent(event._id)}
-                          className="shrink-0 rounded-xl border border-white/10 p-2 text-slate-500 transition hover:border-red-400/30 hover:bg-red-500/10 hover:text-red-300"
-                          aria-label="Delete event"
-                        >
-                          <Trash2 size={15} />
-                        </button>
+                        <div className="flex shrink-0 flex-wrap gap-2 sm:flex-col">
+                          <button
+                            onClick={() => navigate(`/authority/events/${event._id}/command-center`)}
+                            className="flex items-center gap-1.5 rounded-xl border border-cyan-400/25 bg-cyan-400/10 px-3 py-2 text-xs font-medium text-cyan-200 transition hover:bg-cyan-400/15"
+                          >
+                            <Radar size={13} />
+                            Command Center
+                          </button>
+                          <button
+                            onClick={() => navigate(`/authority/events/${event._id}/analytics`)}
+                            className="flex items-center gap-1.5 rounded-xl border border-violet-400/25 bg-violet-400/10 px-3 py-2 text-xs font-medium text-violet-200 transition hover:bg-violet-400/15"
+                          >
+                            <BarChart3 size={13} />
+                            Analytics
+                          </button>
+                          <button
+                            onClick={() => navigate(`/authority/events/${event._id}/map`)}
+                            className="flex items-center gap-1.5 rounded-xl border border-white/10 bg-white/[0.04] px-3 py-2 text-xs font-medium text-slate-300 transition hover:border-cyan-400/20 hover:text-white"
+                          >
+                            <MapPinned size={13} />
+                            Map Editor
+                          </button>
+                          <button
+                            onClick={() => deleteEvent(event._id)}
+                            className="flex items-center justify-center rounded-xl border border-white/10 p-2 text-slate-500 transition hover:border-red-400/30 hover:bg-red-500/10 hover:text-red-300"
+                            aria-label="Delete event"
+                          >
+                            <Trash2 size={15} />
+                          </button>
+                        </div>
                       </motion.div>
                     );
                   })}

@@ -11,6 +11,10 @@ import {
   deleteEvent,
 } from "../controllers/event.controller.js";
 import { getCrowdSnapshot } from "../controllers/crowd.controller.js";
+import { getCommandSnapshot } from "../controllers/command.controller.js";
+import { getAnalyticsSnapshot } from "../controllers/analytics.controller.js";
+import { listMarkers, createMarker, deleteMarker } from "../controllers/marker.controller.js";
+import { createMarkerValidator, markerIdValidator } from "../validators/marker.validator.js";
 
 const router = Router();
 
@@ -20,8 +24,57 @@ router.get("/mine", protect, authorize("authority"), listMyEvents);
 
 router.get("/", protect, listEvents);
 router.get("/:id", protect, eventIdValidator, validate, getEventById);
+
+// Citizen-facing live crowd reading
 router.get("/:id/crowd", protect, eventIdValidator, validate, getCrowdSnapshot);
 
+// Authority-only control room views
+router.get(
+  "/:id/command",
+  protect,
+  authorize("authority"),
+  requireVerifiedAuthority,
+  eventIdValidator,
+  validate,
+  getCommandSnapshot
+);
+
+router.get(
+  "/:id/analytics",
+  protect,
+  authorize("authority"),
+  requireVerifiedAuthority,
+  eventIdValidator,
+  validate,
+  getAnalyticsSnapshot
+);
+
+// Venue map markers — anyone can read, only verified authorities can write
+router.get("/:id/markers", protect, eventIdValidator, validate, listMarkers);
+
+router.post(
+  "/:id/markers",
+  protect,
+  authorize("authority"),
+  requireVerifiedAuthority,
+  eventIdValidator,
+  createMarkerValidator,
+  validate,
+  createMarker
+);
+
+router.delete(
+  "/:id/markers/:markerId",
+  protect,
+  authorize("authority"),
+  requireVerifiedAuthority,
+  eventIdValidator,
+  markerIdValidator,
+  validate,
+  deleteMarker
+);
+
+// Event CRUD (creation/editing)
 router.post(
   "/",
   protect,

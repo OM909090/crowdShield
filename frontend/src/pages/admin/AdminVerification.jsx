@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import toast from "react-hot-toast";
 import { ShieldCheck, Mail, Phone, Building2, Check, UserCog } from "lucide-react";
-import api from "../utils/axios";
+import api from "../../utils/axios";
 
 export default function AdminVerification() {
   const [pending, setPending] = useState([]);
