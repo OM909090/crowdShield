@@ -1,0 +1,53 @@
+{
+  "name": "@crowdshield/mobile",
+  "version": "1.0.0",
+  "private": true,
+  "main": "expo-router/entry",
+  "description": "CrowdShield Android citizen companion — live crowd safety, routing and reporting.",
+  "scripts": {
+    "start": "expo start",
+    "android": "expo run:android",
+    "typecheck": "tsc --noEmit",
+    "lint": "expo lint",
+    "prebuild": "expo prebuild --platform android",
+    "build:apk": "eas build --platform android --profile preview --local"
+  },
+  "dependencies": {
+    "@crowdshield/api-client": "*",
+    "@crowdshield/config": "*",
+    "@crowdshield/types": "*",
+    "@crowdshield/validation": "*",
+    "@expo-google-fonts/inter": "^0.4.2",
+    "@expo/ui": "~57.0.11",
+    "@expo/vector-icons": "^15.0.2",
+    "@maplibre/maplibre-react-native": "^11.3.6",
+    "@react-native-async-storage/async-storage": "2.2.0",
+    "expo": "~57.0.14",
+    "expo-application": "~57.0.2",
+    "expo-build-properties": "~57.0.12",
+    "expo-constants": "~57.0.12",
+    "expo-device": "~57.0.1",
+    "expo-file-system": "~57.0.4",
+    "expo-font": "~57.0.1",
+    "expo-haptics": "~57.0.1",
+    "expo-intent-launcher": "~57.0.1",
+    "expo-linear-gradient": "~57.0.1",
+    "expo-linking": "~57.0.6",
+    "expo-location": "~57.0.11",
+    "expo-notifications": "~57.0.12",
+    "expo-router": "~57.0.14",
+    "expo-secure-store": "~57.0.1",
+    "expo-status-bar": "~57.0.1",
+    "react": "19.2.3",
+    "react-native": "0.86.2",
+    "react-native-gesture-handler": "~2.32.0",
+    "react-native-reanimated": "~4.5.1",
+    "react-native-safe-area-context": "~5.7.0",
+    "react-native-screens": "~4.26.0",
+    "socket.io-client": "^4.8.3"
+  },
+  "devDependencies": {
+    "@types/react": "~19.2.0",
+    "typescript": "~5.9.2"
+  }
+}

@@ -6,6 +6,9 @@ import morgan from "morgan";
 
 import authRoutes from "./routes/auth.routes.js";
 import eventRoutes from "./routes/event.routes.js";
+import providerRoutes from "./routes/provider.routes.js";
+import agentRoutes from "./routes/agent.routes.js";
+import mapsRoutes from "./routes/maps.routes.js";
 import { notFound, errorHandler } from "./middlewares/error.middleware.js";
 
 const app = express();
@@ -28,6 +31,9 @@ app.get("/api/health", (req, res) => res.json({ status: "ok" }));
 
 app.use("/api/auth", authRoutes);
 app.use("/api/events", eventRoutes);
+app.use("/api/ai", providerRoutes);
+app.use("/api/ai", agentRoutes);
+app.use("/api/ai", mapsRoutes);
 // Future routers plug in here, e.g.:
 // app.use("/api/zones", zoneRoutes);
 // app.use("/api/alerts", alertRoutes);

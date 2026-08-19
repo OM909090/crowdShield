@@ -7,7 +7,10 @@
   "scripts": {
     "dev": "nodemon server.js",
     "start": "node server.js",
-    "seed:admin": "node scripts/seedAdmin.js"
+    "seed:admin": "node scripts/seedAdmin.js",
+    "seed:demo": "node scripts/seedDemo.js",
+    "make:admin": "node scripts/makeAdmin.js",
+    "clear:provider": "node scripts/clearProvider.js"
   },
   "dependencies": {
     "bcrypt": "^5.1.1",
@@ -17,10 +20,12 @@
     "express": "^4.19.2",
     "express-rate-limit": "^7.2.0",
     "express-validator": "^7.1.0",
+    "h3-js": "^4.5.0",
     "helmet": "^7.1.0",
     "jsonwebtoken": "^9.0.2",
     "mongoose": "^8.4.0",
-    "morgan": "^1.10.0"
+    "morgan": "^1.10.0",
+    "socket.io": "^4.8.3"
   },
   "devDependencies": {
     "nodemon": "^3.1.0"

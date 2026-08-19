@@ -1,0 +1,27 @@
+{
+  "name": "crowdshield",
+  "version": "1.0.0",
+  "private": true,
+  "description": "CrowdShield — AI-powered early warning system for preventing crowd stampedes. Monorepo: web console, Android citizen app, shared packages, and the API.",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "engines": {
+    "node": ">=20.19.0"
+  },
+  "scripts": {
+    "web": "npm run dev --workspace @crowdshield/web",
+    "mobile": "npm run start --workspace @crowdshield/mobile",
+    "android": "npm run android --workspace @crowdshield/mobile",
+    "api": "npm run dev --prefix backend",
+    "build:web": "npm run build --workspace @crowdshield/web",
+    "lint": "npm run lint --workspace @crowdshield/web",
+    "typecheck": "tsc --build packages/config packages/types packages/validation packages/api-client",
+    "typecheck:mobile": "npm run typecheck --workspace @crowdshield/mobile",
+    "verify": "npm run typecheck && npm run lint && npm run build:web"
+  },
+  "devDependencies": {
+    "typescript": "~5.9.2"
+  }
+}

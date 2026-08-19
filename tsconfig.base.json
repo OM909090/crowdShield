@@ -1,0 +1,28 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+
+    /* Shared packages are consumed as source by Metro (mobile) and Vite (web),
+       so nothing is emitted from the base config — tsc runs as a type checker.
+       Keeping them source-only avoids a build step between editing a type and
+       seeing it in both apps, which is the point of the monorepo. */
+    "noEmit": true,
+    "declaration": false,
+
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "exactOptionalPropertyTypes": false,
+
+    "esModuleInterop": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "verbatimModuleSyntax": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true
+  }
+}

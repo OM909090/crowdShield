@@ -1,0 +1,75 @@
+{
+  "expo": {
+    "name": "CrowdShield",
+    "slug": "crowdshield",
+    "scheme": "crowdshield",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "dark",
+    "newArchEnabled": true,
+    "icon": "./assets/icon.png",
+    "splash": {
+      "image": "./assets/splash.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#020617"
+    },
+    "assetBundlePatterns": [
+      "**/*"
+    ],
+    "android": {
+      "package": "com.crowdshield.citizen",
+      "versionCode": 1,
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#020617"
+      },
+      "permissions": [
+        "ACCESS_COARSE_LOCATION",
+        "ACCESS_FINE_LOCATION",
+        "FOREGROUND_SERVICE",
+        "FOREGROUND_SERVICE_LOCATION",
+        "POST_NOTIFICATIONS",
+        "VIBRATE",
+        "INTERNET",
+        "ACCESS_NETWORK_STATE",
+        "REQUEST_INSTALL_PACKAGES"
+      ]
+    },
+    "plugins": [
+      "expo-router",
+      "expo-secure-store",
+      "expo-font",
+      [
+        "expo-location",
+        {
+          "locationAlwaysAndWhenInUsePermission": "CrowdShield uses your location only while you choose to share it, to warn you about crowding around you and to route you to a safe exit. It is sent anonymised and is never linked to your identity.",
+          "locationWhenInUsePermission": "CrowdShield uses your location to warn you about crowding around you and to route you to a safe exit. It is sent anonymised and is never linked to your identity.",
+          "isAndroidForegroundServiceEnabled": true
+        }
+      ],
+      [
+        "expo-notifications",
+        {
+          "icon": "./assets/notification-icon.png",
+          "color": "#22d3ee",
+          "defaultChannel": "crowd-alerts"
+        }
+      ],
+      "@maplibre/maplibre-react-native",
+      [
+        "expo-build-properties",
+        {
+          "android": {
+            "usesCleartextTraffic": true
+          }
+        }
+      ]
+    ],
+    "extra": {
+      "router": {},
+      "eas": {
+        "projectId": ""
+      }
+    }
+  }
+}

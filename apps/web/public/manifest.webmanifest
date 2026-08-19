@@ -1,0 +1,26 @@
+{
+  "name": "CrowdShield",
+  "short_name": "CrowdShield",
+  "description": "Citizen safety companion — live crowd alerts, safe-route guidance, and one-tap SOS. Your phone helps keep everyone safe by sharing only anonymized location.",
+  "start_url": "/citizen",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#050816",
+  "theme_color": "#050816",
+  "categories": ["utilities", "navigation", "health"],
+  "icons": [
+    {
+      "src": "/favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    },
+    {
+      "src": "/favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "maskable"
+    }
+  ]
+}
