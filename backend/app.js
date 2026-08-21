@@ -14,9 +14,20 @@ import { notFound, errorHandler } from "./middlewares/error.middleware.js";
 const app = express();
 
 app.use(helmet());
+// Browser CORS for the web console. CLIENT_URL may be a comma-separated list so
+// the hosted web app and local dev can both call the API with credentials. The
+// mobile app uses Capacitor's native HTTP and is not subject to browser CORS.
+const corsAllowlist = (process.env.CLIENT_URL || "http://localhost:5173")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
 app.use(
   cors({
-    origin: process.env.CLIENT_URL || "http://localhost:5173",
+    origin(origin, cb) {
+      // Allow non-browser callers (no Origin header) and any allow-listed origin.
+      if (!origin || corsAllowlist.includes(origin)) return cb(null, true);
+      return cb(null, false);
+    },
     credentials: true, // required so the browser sends/receives httpOnly auth cookies
   })
 );

@@ -15,7 +15,12 @@ export const roomName = (eventId) => `event:${eventId}`;
 
 export function initSocket(httpServer) {
   io = new Server(httpServer, {
-    cors: { origin: process.env.CLIENT_URL, credentials: true },
+    // The live feed is open (a client only `subscribe`s — no auth rides this
+    // socket) and is consumed from three origins: the hosted web console, the
+    // packaged mobile app (capacitor://localhost / https://localhost), and local
+    // dev. Reflect the requesting origin so all of them can connect; nothing
+    // sensitive crosses this channel beyond already-aggregated crowd density.
+    cors: { origin: true, credentials: true },
   });
 
   io.on("connection", (socket) => {

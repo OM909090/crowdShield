@@ -55,3 +55,28 @@ services:
         sync: false
       - key: ADMIN_MOBILE
         sync: false
+
+  # ---- Web console (authority + citizen web app) — static site ----
+  # Built from the monorepo ROOT because apps/web depends on the @crowdshield/*
+  # workspace packages, which only resolve once npm installs the workspaces.
+  # The built bundle is baked with the API + socket URLs below, so the browser
+  # app talks to the hosted backend. After first deploy, set the backend
+  # service's CLIENT_URL to this site's https URL (for browser CORS).
+  - type: web
+    name: crowdshield-web
+    runtime: static
+    rootDir: .
+    branch: main
+    buildCommand: npm install && npm run build -w @crowdshield/web
+    staticPublishPath: apps/web/dist
+    autoDeploy: true
+    envVars:
+      - key: VITE_API_URL
+        value: https://crowdshield-api-1qze.onrender.com/api
+      - key: VITE_SOCKET_URL
+        value: https://crowdshield-api-1qze.onrender.com
+    routes:
+      # SPA fallback so client-side routes (/citizen, /events/:id/map) resolve.
+      - type: rewrite
+        source: /*
+        destination: /index.html
