@@ -30,6 +30,9 @@ import { resolvePlace, safestRoadRoute } from "./roadRouter.js";
 import { sampleRoadCongestion } from "./roadCrowd.js";
 import RoadNetwork from "../models/RoadNetwork.js";
 import { validateActions, ACTION_SCHEMA_PROMPT } from "./actionSchema.js";
+import { tightPolygon } from "../utils/hull.js";
+import { haversineMeters } from "../utils/geo.js";
+import { dangerSegmentPenalties } from "./routeSafety.js";
 import { chatStream, getActiveConfig, NoProviderError } from "./llmProvider.js";
 import { alertBus } from "../realtime/alertBus.js";
 import { getIO, roomName } from "../realtime/socket.js";
@@ -80,6 +83,22 @@ function toolsFor({ roadNetwork } = {}) {
 // `${eventId}:${zoneId}` -> last autonomous wake timestamp (dedupe/cooldown).
 const lastWake = new Map();
 
+// eventId -> timestamp a reasoning cycle last STARTED. There are now two wake
+// sources (a hand-drawn zone escalating, and the broadcaster's crowd-condition
+// trigger); they often describe the same moment, so this stops them from firing
+// two inferences at once. A worsening situation (critical) bypasses it.
+const lastCycleAt = new Map();
+const MIN_CYCLE_GAP_MS = 15_000;
+
+function claimCycle(eventId, bypass = false) {
+  const key = String(eventId);
+  const now = Date.now();
+  const last = lastCycleAt.get(key) || 0;
+  if (!bypass && now - last < MIN_CYCLE_GAP_MS) return false;
+  lastCycleAt.set(key, now);
+  return true;
+}
+
 const SYSTEM_PROMPT = `You are CrowdShield's crowd-safety command agent for a live mass-gathering event.
 You are the reasoning layer: deterministic services SENSE and PREDICT; you DIAGNOSE and PROPOSE; a human authority AUTHORIZES consequential moves.
 Operating principles:
@@ -93,6 +112,14 @@ Operating principles:
 - Speak in the names people use. Say "move them onto Grand Road" or "the crowd on Kutcheri Road is stalling", not "zone Z1" — an instruction nobody can follow on the ground is not an instruction. Use \`find_road_route\` to get named turn-by-turn directions before you propose sending anyone anywhere, and \`find_road_exits\` to split a crowd across several ways out instead of funnelling everyone down one.
 - "No readings" is not "clear". If a street or zone has no live data, say so and do not route a crowd down it as though you had checked.
 - The brief ALREADY contains the top risks, time-to-critical, gate/asset status, the crowds, the streets and a list of pre-computed feasible actions. Answer directly from it. Only call a tool for something genuinely missing (a specific zone's detail, a route between two places, or a what-if estimate) — every tool call costs seconds a crowd may not have.
+
+Who you protect, and in what order:
+- Every risk has TWO audiences: the people standing in it, and the control room. Protect the people FIRST — a phone in a pocket can move its owner in seconds, while the room takes minutes to act.
+- So for a crowd that is dense, converging, or forecast to cross a threshold, your FIRST actions are citizen-facing: a \`broadcast_alert\` that names the danger and the way out in short, calm, directive words, and a \`direct_crowd\` that pulls the people IN and APPROACHING that crowd toward the calmest open exit or a less-crowded street. Put these citizen actions before any command-side action.
+- THEN propose the command-side moves for the authority to authorize — \`open_gate\` to add egress, \`close_gate\`/\`suggest_barricade\` to hold or split inflow, \`deploy_units\` for medical or marshals. Consequential moves wait for a human; the citizen alert and diversion should not wait.
+- Act on prediction, not just the present. If a crowd's growth or two groups converging will make a place dangerous soon, alert and divert BEFORE it crosses the line — and say the time-to-critical when the brief gives it. Catching it early is the whole job.
+- Name the specific crowd (its K-id) and the real place (a street or gate) in every alert, so a person on the ground can act on it. "Move away from Singhadwara Chokepoint toward Gate 1" — never "leave zone Z1".
+- When a gate is at or near capacity, do not send more people to it: alert the crowd nearest that gate and divert them to the least-loaded open gate instead.
 ${ACTION_SCHEMA_PROMPT}`;
 
 /** Extract the action envelope JSON from a model reply (tolerates prose/fences). */
@@ -266,8 +293,79 @@ async function reason({ brief, venue, snapshot, roadNetwork }) {
  * route here, server-side, with the same risk-aware router the citizens get, and
  * attach real `waypoints`. Zone highlights get their polygon for the same reason.
  */
+/** A closed [lat,lng] ring approximating a circle of `radiusM` around a centre. */
+function circlePolygon(center, radiusM, points = 18) {
+  const lat = center?.[0];
+  const lng = center?.[1];
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+  const R = 6378137; // earth radius, metres
+  const d = Math.max(Number(radiusM) || 0, 20) / R;
+  const latR = (lat * Math.PI) / 180;
+  const ring = [];
+  for (let i = 0; i < points; i += 1) {
+    const brng = (2 * Math.PI * i) / points;
+    const lat2 = Math.asin(Math.sin(latR) * Math.cos(d) + Math.cos(latR) * Math.sin(d) * Math.cos(brng));
+    const lng2 =
+      (lng * Math.PI) / 180 +
+      Math.atan2(Math.sin(brng) * Math.sin(d) * Math.cos(latR), Math.cos(d) - Math.sin(latR) * Math.sin(lat2));
+    ring.push([(lat2 * 180) / Math.PI, (lng2 * 180) / Math.PI]);
+  }
+  if (ring.length) ring.push(ring[0]);
+  return ring;
+}
+
 export function withGeometry(action, venue, snapshot, roadNetwork = null) {
   if (!action || !venue) return action;
+
+  // A flagged danger area is drawn around the live crowd it names: resolve the
+  // K-id to that crowd's footprint (centroid + radius) so the map has a polygon.
+  if (action.type === "flag_area" && action.clusterId) {
+    const cluster = (snapshot?.clusters || []).find((k) => k.id === action.clusterId);
+    if (cluster?.centroid) {
+      // Draw a TIGHT hull around the crowd's dense cells — the packed pocket, not
+      // a radius circle that would sweep in empty ground (the old "whole map" bug).
+      const reach = (cluster.radiusM || 60) + 30;
+      const denseNear = (snapshot?.cells || []).filter(
+        (c) =>
+          Array.isArray(c.center) &&
+          ["dense", "critical", "dangerous"].includes(c.level) &&
+          haversineMeters(cluster.centroid, c.center) <= reach
+      );
+      let polygon = denseNear.length ? tightPolygon(denseNear.map((c) => c.center), 22) : null;
+      // Fallback: a SMALL capped circle, never the crowd's full radius.
+      if (!polygon || polygon.length < 3) {
+        polygon = circlePolygon(cluster.centroid, Math.min(cluster.radiusM || 40, 60));
+      }
+      if (polygon) {
+        return {
+          ...action,
+          polygon,
+          center: cluster.centroid,
+          personsEst: cluster.personsEst ?? null,
+          density: cluster.density ?? null,
+          level: cluster.level ?? null,
+        };
+      }
+    }
+    return action;
+  }
+
+  // A barricade suggestion resolves to a single point the map pins: the midpoint
+  // of the named corridor, or the coordinate of the named node.
+  if (action.type === "suggest_barricade") {
+    if (action.edgeId) {
+      const edge = (venue.edges || []).find((e) => e.id === action.edgeId);
+      const path = edge?.path || [];
+      if (path.length) {
+        return { ...action, at: path[Math.floor(path.length / 2)], targetName: edge.name || edge.id };
+      }
+    }
+    if (action.nodeId) {
+      const node = (venue.nodes || []).find((n) => n.id === action.nodeId);
+      if (node?.at) return { ...action, at: node.at, targetName: node.name || node.id };
+    }
+    return action;
+  }
 
   // A street directive is symbolic until it is resolved: "ZC1 -> Grand Road" has
   // to become an actual path along real roads, avoiding the ones that are
@@ -282,7 +380,9 @@ export function withGeometry(action, venue, snapshot, roadNetwork = null) {
     const congestion = new Map();
     for (const row of sampleRoadCongestion(roadNetwork, snapshot)) congestion.set(row.id, row);
 
-    const res = safestRoadRoute(roadNetwork, congestion, start.id, end.id);
+    // Route the crowd AROUND live danger zones, not just off crowded streets.
+    const extraCostBySegmentId = dangerSegmentPenalties(roadNetwork, snapshot);
+    const res = safestRoadRoute(roadNetwork, congestion, start.id, end.id, { extraCostBySegmentId });
     if (!res.ok) return { ...action, unroutable: res.message };
     return {
       ...action,
@@ -387,6 +487,7 @@ export async function runAgentCycle({ event, venue, snapshot, roadNetwork = null
 
   const { valid } = validateActions(Array.isArray(envelope.actions) ? envelope.actions : [], venue || {}, {
     roadNetwork,
+    clusters: snapshot?.clusters || [],
   });
 
   const actions = valid.map((a) => {
@@ -435,29 +536,58 @@ export async function runAgentCycle({ event, venue, snapshot, roadNetwork = null
 export function initAgent() {
   alertBus.on("alert", async (evt) => {
     try {
-      if (!evt || evt.kind !== "risk_escalation") return;
+      if (!evt) return;
+      // Only two kinds wake the agent; "resolved" and anything else are ignored.
+      if (evt.kind !== "risk_escalation" && evt.kind !== "crowd_condition") return;
 
       const cfg = await getActiveConfig();
       if (!cfg) return; // no provider -> stay silent, Tier 0/1 keep working
 
       const eventId = evt.eventId;
-      const zoneId = evt.alert?.zoneId || "unknown";
-      const key = `${eventId}:${zoneId}`;
-      const now = Date.now();
-      const last = lastWake.get(key) || 0;
-      if (now - last < WAKE_COOLDOWN_MS && evt.alert?.severity !== "critical") return;
-      lastWake.set(key, now);
+
+      // (a) A hand-drawn zone crossed a threshold — the original signal. Kept as
+      // a per-zone cooldown so one persistently-hot zone can't storm.
+      if (evt.kind === "risk_escalation") {
+        const zoneId = evt.alert?.zoneId || "unknown";
+        const critical = evt.alert?.severity === "critical";
+        const key = `${eventId}:${zoneId}`;
+        const now = Date.now();
+        const last = lastWake.get(key) || 0;
+        if (now - last < WAKE_COOLDOWN_MS && !critical) return;
+        if (!claimCycle(eventId, critical)) return; // a crowd_condition just ran
+        lastWake.set(key, now);
+
+        const ctx = await loadContext(eventId);
+        if (!ctx) return;
+        await runAgentCycle({
+          ...ctx,
+          trigger: {
+            type: "risk_escalation",
+            severity: evt.alert?.severity,
+            zoneId,
+            zoneName: evt.alert?.zoneName,
+          },
+        });
+        return;
+      }
+
+      // (b) The broadcaster's crowd-condition trigger fired (hotspot, dense/
+      // converging/fast-growing crowd, or an escalated zone). Its own cadence +
+      // escalation gate already decided this is worth a look; the cross-source
+      // guard only stops it colliding with a zone alert in the same instant.
+      const cond = evt.condition || {};
+      const critical = cond.severity === "critical";
+      if (!claimCycle(eventId, critical)) return;
 
       const ctx = await loadContext(eventId);
       if (!ctx) return;
-
       await runAgentCycle({
         ...ctx,
         trigger: {
-          type: "risk_escalation",
-          severity: evt.alert?.severity,
-          zoneId,
-          zoneName: evt.alert?.zoneName,
+          type: "crowd_condition",
+          severity: cond.severity,
+          zoneName: cond.focus?.label,
+          reason: Array.isArray(cond.reasons) ? cond.reasons.join("; ") : undefined,
         },
       });
     } catch (err) {
@@ -467,5 +597,5 @@ export function initAgent() {
       }
     }
   });
-  console.log("[agent] subscribed to alertBus (autonomous wake armed)");
+  console.log("[agent] subscribed to alertBus (autonomous wake armed: zones + crowd conditions)");
 }

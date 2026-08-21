@@ -21,6 +21,7 @@
 import { computeWalkingRoutes } from "./routing/index.js";
 import { rankRoutesByRisk, decodePolyline } from "./routeFusion.js";
 import { haversineMeters } from "../utils/geo.js";
+import { computeGateLoads } from "./gateLoad.js";
 
 const MAX_EXIT_GATES = 3;
 
@@ -50,7 +51,18 @@ export async function findSafeExitRoute({ venue, snapshot, from }) {
     return { ok: false, message: "A location is required to find an exit route." };
   }
 
-  const gates = nearestOpenGates(from, snapshot, venue);
+  let gates = nearestOpenGates(from, snapshot, venue);
+  // Don't send people to a gate that's already jammed — drop overloaded ones,
+  // unless that would leave nowhere to go.
+  const overloaded = new Set(
+    computeGateLoads(snapshot?.cells || [], venue)
+      .filter((g) => g.level === "overload")
+      .map((g) => g.id)
+  );
+  if (overloaded.size) {
+    const usable = gates.filter((g) => !overloaded.has(g.node.id));
+    if (usable.length) gates = usable;
+  }
   if (!gates.length) {
     return { ok: false, message: "No open exit gate is available right now — follow marshal directions." };
   }

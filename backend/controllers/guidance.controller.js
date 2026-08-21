@@ -28,6 +28,7 @@ import {
   nearestJunction,
 } from "../services/roadRouter.js";
 import { sampleRoadCongestion } from "../services/roadCrowd.js";
+import { dangerSegmentPenalties, openExitsByLoad } from "../services/routeSafety.js";
 
 export const getGuidance = asyncHandler(async (req, res) => {
   const event = await Event.findById(req.params.id);
@@ -108,7 +109,8 @@ async function routeOverStreets(eventId, venue, snapshot, { from, destinationId 
   const congestion = new Map();
   for (const row of sampleRoadCongestion(network, snapshot)) congestion.set(row.id, row);
 
-  const res = safestRoadRoute(network, congestion, startJ, endJ);
+  const extraCostBySegmentId = dangerSegmentPenalties(network, snapshot);
+  const res = safestRoadRoute(network, congestion, startJ, endJ, { extraCostBySegmentId });
   return res.ok ? res.route : null;
 }
 
@@ -155,15 +157,20 @@ export const getExitRoute = asyncHandler(async (req, res) => {
   // Without an imported network we fall back to the external routing engine.
   const roadNetwork = await RoadNetwork.findOne({ event: req.params.id });
   if (roadNetwork?.segments?.length) {
-    const exits = (venue.nodes || [])
+    const allExits = (venue.nodes || [])
       .filter((n) => (n.type === "gate" || n.type === "exit") && n.state !== "closed")
       .map((n) => ({ id: n.id, name: n.name || n.id, at: n.at }));
+    // Don't route people to a gate that is already jammed — prefer one that can
+    // still take them. Falls back to all gates only if every one is overloaded.
+    const exits = openExitsByLoad(allExits, snap, venue);
 
     if (exits.length) {
       const congestion = new Map();
       for (const row of sampleRoadCongestion(roadNetwork, snap)) congestion.set(row.id, row);
 
-      const res2 = safestRoadExits(roadNetwork, congestion, [lat, lng], exits);
+      // Bend the route around live danger zones (dense pockets).
+      const extraCostBySegmentId = dangerSegmentPenalties(roadNetwork, snap);
+      const res2 = safestRoadExits(roadNetwork, congestion, [lat, lng], exits, { extraCostBySegmentId });
       if (res2.ok) {
         const best = res2.best;
         const gate = (venue.nodes || []).find((n) => n.id === best.exitId);

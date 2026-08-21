@@ -179,6 +179,22 @@ export function buildCandidates(venue, snapshot, roadNetwork = null) {
   const routeCandidate = worstZoneRouteCandidate(venue, snapshot);
   if (routeCandidate) candidates.push(routeCandidate);
 
+  // (e) Flag a danger area around the worst live crowd that no authored zone
+  // covers. This is the move that lets the agent mark risk on an event with no
+  // zones drawn — it outlines the ground the crowd is actually on.
+  const crowds = (snapshot?.clusters || []).filter((k) => k.isCrowd || k.isSignificant);
+  if (crowds.length) {
+    const worstCrowd = crowds.reduce((a, b) => ((b.density ?? 0) > (a.density ?? 0) ? b : a), crowds[0]);
+    if (worstCrowd && (worstCrowd.isCrowd || (worstCrowd.personsEst ?? 0) >= 500)) {
+      candidates.push({
+        label:
+          `Flag danger area around ${worstCrowd.id} ` +
+          `(~${worstCrowd.personsEst} people${worstCrowd.density != null ? `, ${worstCrowd.density} p/m²` : ""})`,
+        action: { type: "flag_area", clusterId: worstCrowd.id },
+      });
+    }
+  }
+
   return candidates;
 }
 
@@ -344,7 +360,13 @@ function summarizeTrigger(trigger) {
   if (sev) parts.push(String(sev).toUpperCase());
   const zone = trigger.zoneName || trigger.zoneId;
   if (zone) parts.push(`@ ${zone}`);
-  return parts.join(" ") || "event trigger";
+  let line = parts.join(" ") || "event trigger";
+  // The crowd-condition trigger carries the specific reasons it woke on (a
+  // hotspot, converging crowds, a fast-growing body of people) — pass them
+  // through so the agent reasons about the thing that actually fired, not a bare
+  // "crowd_condition".
+  if (trigger.reason) line += ` — ${trigger.reason}`;
+  return line;
 }
 
 /** Compact symbolic form of an action, e.g. "open_gate G2" or "draw_route N1 N2". */

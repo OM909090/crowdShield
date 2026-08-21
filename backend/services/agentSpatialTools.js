@@ -23,6 +23,7 @@
  * opposite decisions.
  */
 import { sampleRoadCongestion, getCongestedRoads } from "./roadCrowd.js";
+import { dangerSegmentPenalties, openExitsByLoad } from "./routeSafety.js";
 import {
   buildRoadGraph,
   nearestJunction,
@@ -308,7 +309,8 @@ export function findRoadRoute({ roadNetwork, snapshot, venue } = {}, { from, to 
   if (end.error) return { ok: false, message: end.error };
 
   const congestion = congestionIndex(roadNetwork, snapshot);
-  const res = safestRoadRoute(roadNetwork, congestion, start.id, end.id);
+  const extraCostBySegmentId = dangerSegmentPenalties(roadNetwork, snapshot);
+  const res = safestRoadRoute(roadNetwork, congestion, start.id, end.id, { extraCostBySegmentId });
   if (!res.ok) return res;
 
   return {
@@ -349,16 +351,19 @@ export function findRoadExits({ roadNetwork, snapshot, venue } = {}, { from } = 
     return { ok: false, message: "A [lat, lng] starting point is required." };
   }
 
-  const exits = (venue?.nodes || [])
+  const allExits = (venue?.nodes || [])
     .filter((n) => (n.type === "gate" || n.type === "exit") && n.state !== "closed")
     .map((n) => ({ id: n.id, name: n.name || n.id, at: n.at }));
 
-  if (!exits.length) {
+  if (!allExits.length) {
     return { ok: false, message: "Every gate is closed — there is no open exit to route to." };
   }
+  // Prefer gates that can still take people; avoid streets through danger zones.
+  const exits = openExitsByLoad(allExits, snapshot, venue);
 
   const congestion = congestionIndex(roadNetwork, snapshot);
-  const res = safestRoadExits(roadNetwork, congestion, from, exits);
+  const extraCostBySegmentId = dangerSegmentPenalties(roadNetwork, snapshot);
+  const res = safestRoadExits(roadNetwork, congestion, from, exits, { extraCostBySegmentId });
   if (!res.ok) return res;
 
   return {

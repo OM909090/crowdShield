@@ -13,6 +13,9 @@ import { aggregate, filterToCoverage } from "../services/aggregator.js";
 import { advance as predictorAdvance } from "../services/predictor.js";
 import { handleTransitions, syncActiveAlerts } from "../services/alerts.js";
 import { advanceClusters } from "../services/clusterTracker.js";
+import { maybeWakeAgent } from "../services/agentTrigger.js";
+import { detectDangerZones } from "../services/dangerZones.js";
+import { computeGateLoads } from "../services/gateLoad.js";
 import { cellAreaM2 } from "../utils/h3.js";
 
 const TICK_MS = 1000;
@@ -78,6 +81,15 @@ async function tick(eventId) {
     // Tier 1: decorate zones with risk/forecast/state and detect escalations.
     const { zones: riskZones, transitions } = predictorAdvance(eventId, zones, { stepSeconds: TICK_MS / 1000 });
 
+    // Live danger pockets: tight polygons around genuinely dense cells, computed
+    // every tick with no LLM in the loop. This is the always-on "danger zone"
+    // layer the map draws — multiple, sized to the actual crowd, not one blob.
+    const dangerZones = detectDangerZones(cells);
+
+    // How hard each open gate is being pushed — for the map's overload pulse and
+    // the agent's divert decision.
+    const gateLoads = computeGateLoads(cells, s.venue);
+
     // Keep open alerts aligned with reality: refresh the ones whose zones are
     // still elevated, resolve the ones that have calmed. Fire-and-forget so a
     // slow write can't delay the frame.
@@ -101,6 +113,17 @@ async function tick(eventId) {
           }
         })
         .catch((err) => console.error("[alerts] persist failed:", err.message));
+    }
+
+    // Wake the Tier 2 agent on ANY dangerous crowd condition — density hotspots,
+    // a dense/converging/fast-growing tracked crowd, or an escalated zone — not
+    // only on hand-drawn zone alerts. This is what lets the agent act on an event
+    // that has no zones authored, and keep acting while the area stays dangerous.
+    // Assessment is cheap; the trigger itself throttles how often it wakes.
+    try {
+      maybeWakeAgent(eventId, { cells, clusters, clusterEvents, zones: riskZones, totals, gateLoads });
+    } catch (err) {
+      console.error(`[agent-trigger] assess failed for ${eventId}:`, err.message);
     }
 
     // h/s stay null when the device hasn't reported motion — the client draws a
@@ -146,6 +169,8 @@ async function tick(eventId) {
       })),
       clusterEvents,
       zones: riskZones,
+      dangerZones,
+      gateLoads,
       totals,
     });
   } catch (err) {

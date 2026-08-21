@@ -307,7 +307,7 @@ export function safestRoadRoute(
   congestionById = new Map(),
   fromJunctionId,
   toJunctionId,
-  { alpha = DEFAULT_ALPHA, avoidSegmentIds = new Set() } = {}
+  { alpha = DEFAULT_ALPHA, avoidSegmentIds = new Set(), extraCostBySegmentId = new Map() } = {}
 ) {
   const graph = buildRoadGraph(network);
   if (!graph.junctionPos.size) {
@@ -355,7 +355,11 @@ export function safestRoadRoute(
       const cost = segmentCost(segment, congestionById.get(edge.segmentId), alpha);
       if (!Number.isFinite(cost)) continue; // impassable — never route through it
 
-      const next = best + cost;
+      // Extra seconds for a street that runs through a live danger zone. A soft
+      // penalty, so the route detours around a dense pocket but is still returned
+      // when there is genuinely no other way.
+      const extra = extraCostBySegmentId.get(edge.segmentId) || 0;
+      const next = best + cost + extra;
       if (next < (dist.get(edge.to) ?? Infinity)) {
         dist.set(edge.to, next);
         prev.set(edge.to, { from: current, edge });

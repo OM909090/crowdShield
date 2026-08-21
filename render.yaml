@@ -1,0 +1,57 @@
+# Render Blueprint — deploys the CrowdShield backend (REST API + Socket.IO) as a
+# public HTTPS service, so the Android app works on ANY device without adb
+# reverse tunnels or a laptop on the same Wi-Fi.
+#
+# The backend code is UNCHANGED. It already reads everything it needs from the
+# environment: server.js uses `process.env.PORT` (Render sets this), config/db.js
+# uses `process.env.MONGO_URI`, and app.js reads `process.env.CLIENT_URL` for
+# browser CORS. This file only wires those into Render.
+#
+# The mobile app needs nothing on the server side: it authenticates with a
+# captured-and-replayed cookie (not a browser cookie), so CORS and SameSite do
+# not apply to it. Point the app at the service's https URL (see
+# apps/mobile/.env.example) and it works.
+#
+# One-time values to set in the Render dashboard (marked `sync: false`):
+#   MONGO_URI  — a MongoDB Atlas connection string INCLUDING the db name, e.g.
+#                mongodb+srv://user:pass@cluster.abc.mongodb.net/crowd_help
+#                (Render has no managed MongoDB; the free Atlas M0 tier is enough.)
+#   CLIENT_URL — the deployed web console origin, for browser CORS only. The
+#                mobile app does not need it. If the web app isn't hosted yet,
+#                set it to your web dev origin or leave it and host later.
+#   ADMIN_*    — optional; only used by `npm run seed:admin`.
+
+services:
+  - type: web
+    name: crowdshield-api
+    runtime: node
+    rootDir: backend            # build + run inside /backend (standalone, no workspace deps)
+    plan: free                  # free tier sleeps after ~15 min idle → ~50s cold start
+    region: singapore           # closest Render region to India; change if you prefer
+    branch: main
+    buildCommand: npm install
+    startCommand: npm start     # = node server.js
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production
+      # PORT is injected by Render automatically — do NOT set it here.
+      - key: MONGO_URI
+        sync: false
+      - key: JWT_ACCESS_SECRET
+        generateValue: true     # Render generates a strong random secret
+      - key: JWT_ACCESS_EXPIRES
+        value: 15m
+      - key: JWT_REFRESH_SECRET
+        generateValue: true
+      - key: JWT_REFRESH_EXPIRES
+        value: 7d
+      - key: CLIENT_URL
+        sync: false
+      - key: ADMIN_EMAIL
+        sync: false
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: ADMIN_MOBILE
+        sync: false

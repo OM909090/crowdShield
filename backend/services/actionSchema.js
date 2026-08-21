@@ -40,6 +40,21 @@ export const ACTION_TYPES = {
    * changes no gate.
    */
   direct_crowd: { klass: "advisory", required: ["from", "to"] },
+  /**
+   * Draw a danger area on the map around a LIVE tracked crowd (K1, K2 … from the
+   * brief's CROWDS list) when it is dense/dangerous and no authored zone covers
+   * it. This is how the agent marks risk on an event where the operator never
+   * drew zones — it flags the ground the crowd is actually standing on. Advisory:
+   * it only outlines an area, it moves nobody and changes no gate.
+   */
+  flag_area: { klass: "advisory", required: ["clusterId"] },
+  /**
+   * Recommend the authority physically place a barricade to hold back or split a
+   * flow, at a corridor (edgeId) or a point (nodeId) from the venue graph. It
+   * points at the spot and gives the reason; a human puts the barrier there — so
+   * it is advisory (a suggestion on the map), not a consequential state change.
+   */
+  suggest_barricade: { klass: "advisory", required: ["reason"] },
 
   // ---- Consequential: changes reality, needs human sign-off ----
   open_gate: { klass: "consequential", required: ["gateId"] },
@@ -105,6 +120,27 @@ function invalidReason(action, refs) {
       if (!EDGE_DIRECTIONS.has(action.direction)) return `invalid direction '${action.direction}'`;
       break;
 
+    case "flag_area":
+      // Must name a crowd the tracker is actually holding, so the drawn area
+      // sits on real people rather than a hallucinated id.
+      if (!refs.clusterIds.has(action.clusterId)) {
+        return `unknown clusterId '${action.clusterId}' (must be a live crowd from the CROWDS list, e.g. K1)`;
+      }
+      break;
+
+    case "suggest_barricade": {
+      // A barricade goes on a corridor or a point; at least one must be given and
+      // must exist in the graph.
+      const hasEdge = action.edgeId !== undefined && action.edgeId !== null && action.edgeId !== "";
+      const hasNode = action.nodeId !== undefined && action.nodeId !== null && action.nodeId !== "";
+      if (!hasEdge && !hasNode) {
+        return "must reference an edgeId (corridor) or nodeId (point) where the barricade goes";
+      }
+      if (hasEdge && !edgeIds.has(action.edgeId)) return `unknown edgeId '${action.edgeId}'`;
+      if (hasNode && !nodeIds.has(action.nodeId)) return `unknown nodeId '${action.nodeId}'`;
+      break;
+    }
+
     case "open_gate":
     case "close_gate":
       if (!gateIds.has(action.gateId)) {
@@ -140,12 +176,15 @@ function invalidReason(action, refs) {
  * @param {Object} venue  the Venue graph (zones/nodes/edges)
  * @returns {{ valid: Array<Object>, invalid: Array<{action:Object, reason:string}> }}
  */
-export function validateActions(actions = [], venue = {}, { roadNetwork = null } = {}) {
+export function validateActions(actions = [], venue = {}, { roadNetwork = null, clusters = [] } = {}) {
   const refs = {
     zoneIds: new Set((venue.zones || []).map((z) => z.id)),
     nodeIds: new Set((venue.nodes || []).map((n) => n.id)),
     gateIds: new Set((venue.nodes || []).filter((n) => n.type === "gate").map((n) => n.id)),
     edgeIds: new Set((venue.edges || []).map((e) => e.id)),
+    // Live tracked crowds (K1, K2 …) so flag_area can be validated against a real
+    // body of people rather than an invented id.
+    clusterIds: new Set((clusters || []).map((k) => k.id)),
     venue,
     roadNetwork,
   };
@@ -188,6 +227,15 @@ ADVISORY (applied immediately, no human sign-off):
         network, avoiding streets that are currently crowded. This is how you tell
         thousands of people which way to walk — prefer it over draw_route when a
         street network is available.
+  - flag_area          { "clusterId": string, "severity"?: "low"|"medium"|"high"|"critical", "reason"?: string }
+        Draw a danger area on the map around a LIVE crowd (a K-id from the CROWDS
+        list) when it is dense or dangerous and no authored zone covers it. This
+        is how you mark risk on an event with no zones drawn — flag the crowd that
+        is actually there.
+  - suggest_barricade  { "edgeId"?: string, "nodeId"?: string, "reason": string }
+        Recommend the authority place a physical barricade at a corridor (edgeId)
+        or point (nodeId) from ASSETS, to hold back or split a flow. Use it to
+        pin the exact spot a barrier would relieve pressure.
 
 CONSEQUENTIAL (queued for human sign-off before taking effect):
   - open_gate          { "gateId": string }
