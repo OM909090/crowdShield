@@ -18,6 +18,10 @@ import AiProvider from "../pages/settings/AiProvider";
 
 import ProtectedRoute from "../components/ProtectedRoute";
 import { useAuth } from "../context/AuthContext";
+import VerifyOtp from "../pages/VerifyOTtp";
+import GoogleSignupComplete from "../pages/GoogleSignupComplete";
+import ResetPassword from "../pages/ResetPassword";
+import ForgotPassword from "../pages/ForgotPassword";
 
 const ANY_AUTH = ["citizen", "authority", "admin"];
 
@@ -42,6 +46,10 @@ export default function AppRoutes() {
       <Route path="/" element={<Landing />} />
       <Route path="/login" element={<Login />} />
       <Route path="/signup" element={<Signup />} />
+      <Route path="/verify-otp" element={<VerifyOtp />} />
+      <Route path="/signup/google" element={<GoogleSignupComplete />} />
+      <Route path="/forgot-password" element={<ForgotPassword />} />
+      <Route path="/reset-password" element={<ResetPassword />} />
 
       {/* Legacy: role-aware forward to the real console. */}
       <Route path="/dashboard" element={<DashboardRedirect />} />

@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { useForm } from "react-hook-form";
+import { GoogleLogin } from "@react-oauth/google";
 import {
   Eye,
   EyeOff,
@@ -15,6 +16,7 @@ import {
   Sparkles,
   ArrowRight,
   Building2,
+  AlertCircle,
 } from "lucide-react";
 import { NavLink, useNavigate } from "react-router-dom";
 import { motion, AnimatePresence } from "framer-motion";
@@ -53,6 +55,9 @@ export default function Signup() {
   const { setUser } = useAuth();
   const [showPassword, setShowPassword] = useState(false);
   const [location, setLocation] = useState(null);
+  const [locationError, setLocationError] = useState("");
+  const [requestingLocation, setRequestingLocation] = useState(false);
+  const [googleLoading, setGoogleLoading] = useState(false);
 
   const {
     register,
@@ -79,9 +84,13 @@ export default function Signup() {
 
   const requestLocation = () => {
     if (!navigator.geolocation) {
+      setLocationError("Geolocation isn't supported by this browser");
       toast.error("Geolocation is not supported by this browser");
       return;
     }
+
+    setRequestingLocation(true);
+    setLocationError("");
 
     navigator.geolocation.getCurrentPosition(
       (position) => {
@@ -91,9 +100,13 @@ export default function Signup() {
         };
 
         setLocation(coordinates);
+        setLocationError("");
+        setRequestingLocation(false);
         toast.success("Location access enabled");
       },
       () => {
+        setRequestingLocation(false);
+        setLocationError("Location access is required to create an account");
         toast.error("Location permission denied");
       },
       { enableHighAccuracy: true, timeout: 10000 }
@@ -101,6 +114,12 @@ export default function Signup() {
   };
 
   const submitHandler = async (data) => {
+    if (!location) {
+      setLocationError("Please allow location access before continuing");
+      toast.error("Location access is required");
+      return;
+    }
+
     try {
       const payload = {
         ...data,
@@ -109,11 +128,41 @@ export default function Signup() {
       };
 
       const res = await api.post("/auth/signup", payload);
-      setUser(res.data.user); // signup issues a session too — log straight in
-      toast.success("Account created successfully");
-      navigate(data.role === "authority" ? "/authority/events" : "/events", { replace: true });
+      toast.success("Verification code sent to your email and phone");
+      navigate("/verify-otp", {
+        replace: true,
+        state: {
+          userId: res.data.userId,
+          email: res.data.email,
+          mobile: res.data.mobile,
+          role: data.role,
+        },
+      });
     } catch (err) {
       toast.error(err.response?.data?.message || "Signup failed");
+    }
+  };
+
+  const handleGoogleSuccess = async (credentialResponse) => {
+    setGoogleLoading(true);
+    try {
+      const res = await api.post("/auth/google", { credential: credentialResponse.credential });
+
+      if (res.data.newUser) {
+        // Google verified their email, but we still need mobile/age/location etc.
+        navigate("/signup/google", { state: res.data.profile });
+        return;
+      }
+
+      setUser(res.data.user);
+      toast.success("Logged in with Google");
+      navigate(res.data.user.role === "authority" ? "/authority/events" : "/events", {
+        replace: true,
+      });
+    } catch (err) {
+      toast.error(err.response?.data?.message || "Google sign-in failed");
+    } finally {
+      setGoogleLoading(false);
     }
   };
 
@@ -172,7 +221,7 @@ export default function Signup() {
               {[
                 ["Real-time insights", "Live density and bottleneck tracking"],
                 ["Secure auth", "Password hashing + JWT cookies"],
-                ["Location aware", "Optional geolocation for incident response"],
+                ["Location aware", "Required for accurate incident response"],
                 ["Authority ready", "Built for dashboard operations"],
               ].map(([title, desc]) => (
                 <motion.div
@@ -217,6 +266,27 @@ export default function Signup() {
                     </p>
                   </motion.div>
                 </AnimatePresence>
+              </div>
+
+              {/* Google Sign-In */}
+              <div className="mb-6 flex flex-col items-center gap-4">
+                <div className="flex w-full justify-center">
+                  <GoogleLogin
+                    theme="filled_black"
+                    shape="pill"
+                    width="320"
+                    text="signup_with"
+                    onSuccess={handleGoogleSuccess}
+                    onError={() => toast.error("Google sign-in failed")}
+                  />
+                </div>
+                {googleLoading && <p className="text-xs text-slate-500">Signing you in…</p>}
+
+                <div className="flex w-full items-center gap-3">
+                  <div className="h-px flex-1 bg-white/10" />
+                  <span className="text-xs uppercase tracking-widest text-slate-500">or fill in your details</span>
+                  <div className="h-px flex-1 bg-white/10" />
+                </div>
               </div>
 
               <motion.form
@@ -290,6 +360,7 @@ export default function Signup() {
                       />
                     </div>
                     {errors.mobile && <p className="text-sm text-red-400">{errors.mobile.message}</p>}
+                    <p className="text-xs text-slate-500">We'll text a verification code to this number.</p>
                   </motion.div>
 
                   <motion.div variants={itemVariants} className={fieldWrap}>
@@ -445,28 +516,43 @@ export default function Signup() {
                   </AnimatePresence>
                 </motion.div>
 
-                <motion.button
-                  type="button"
-                  onClick={requestLocation}
-                  whileTap={{ scale: 0.98 }}
-                  className={`mt-1 flex w-full items-center justify-center gap-2 rounded-2xl border px-4 py-3.5 transition ${
-                    location
-                      ? "border-emerald-400/30 bg-emerald-500/10 text-emerald-200 hover:bg-emerald-500/15"
-                      : "border-cyan-400/25 bg-cyan-400/10 text-cyan-200 hover:bg-cyan-400/15"
-                  }`}
-                >
-                  <MapPin size={18} />
-                  {location ? "✓ Location Enabled" : "Allow Location Access"}
-                </motion.button>
+                {/* Location — now mandatory */}
+                <div className={fieldWrap}>
+                  <motion.button
+                    type="button"
+                    onClick={requestLocation}
+                    disabled={requestingLocation}
+                    whileTap={{ scale: 0.98 }}
+                    className={`mt-1 flex w-full items-center justify-center gap-2 rounded-2xl border px-4 py-3.5 transition disabled:cursor-not-allowed disabled:opacity-70 ${
+                      location
+                        ? "border-emerald-400/30 bg-emerald-500/10 text-emerald-200 hover:bg-emerald-500/15"
+                        : locationError
+                        ? "border-red-400/30 bg-red-500/10 text-red-200 hover:bg-red-500/15"
+                        : "border-cyan-400/25 bg-cyan-400/10 text-cyan-200 hover:bg-cyan-400/15"
+                    }`}
+                  >
+                    <MapPin size={18} />
+                    {requestingLocation
+                      ? "Requesting location…"
+                      : location
+                      ? "✓ Location Enabled"
+                      : "Allow Location Access (required)"}
+                  </motion.button>
+                  {locationError && (
+                    <p className="flex items-center gap-1.5 text-sm text-red-400">
+                      <AlertCircle size={14} /> {locationError}
+                    </p>
+                  )}
+                </div>
 
                 <motion.button
                   type="submit"
-                  disabled={isSubmitting}
+                  disabled={isSubmitting || !location}
                   whileHover={{ scale: 1.02, y: -1 }}
                   whileTap={{ scale: 0.98 }}
                   className="group inline-flex w-full items-center justify-center gap-2 rounded-2xl bg-gradient-to-r from-cyan-400 to-blue-500 px-5 py-3.5 font-semibold text-slate-950 shadow-lg shadow-cyan-500/20 transition disabled:cursor-not-allowed disabled:opacity-60"
                 >
-                  {isSubmitting ? "Creating Account..." : isAuthority ? "Request Authority Access" : "Create Account"}
+                  {isSubmitting ? "Sending code…" : isAuthority ? "Request Authority Access" : "Create Account"}
                   {!isSubmitting && <ArrowRight className="h-4 w-4 transition-transform group-hover:translate-x-1" />}
                 </motion.button>
 
