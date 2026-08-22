@@ -6,8 +6,10 @@
  * joiners), then push to the event room over Socket.IO. Citizens are already in
  * that room via the live crowd feed, so no extra plumbing is needed.
  *
- * The agent can never call this directly — `broadcast_alert` is a CONSEQUENTIAL
- * action, so it only lands here after human sign-off.
+ * `broadcast_alert` is a CONSEQUENTIAL action, so it normally lands here only
+ * after human sign-off. The one exception is a CRITICAL, zone-TARGETED alert:
+ * the agent sends that autonomously (source "agent") the instant it decides it,
+ * because a crush warning cannot wait for a click — see agent.js.
  */
 import Broadcast, { serializeBroadcast } from "../models/Broadcast.js";
 import { getIO, roomName } from "../realtime/socket.js";

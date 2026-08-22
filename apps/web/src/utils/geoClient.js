@@ -121,3 +121,132 @@ export function formatArea(m2) {
   if (value < 1e6) return `${Math.round(value).toLocaleString()} m²`;
   return `${(value / 1e6).toFixed(2)} km²`;
 }
+
+/**
+ * Is [lat,lng] inside a polygon ring? Ray-casting, mirroring
+ * `backend/utils/geo.js` so the client agrees with the server about who is
+ * inside a zone. The ring is treated as closed; winding order is irrelevant.
+ *
+ * Used for zone-targeted announcements: a citizen only shows an announcement
+ * addressed to specific zones when they are actually standing in one of them.
+ *
+ * @param {[number,number]} point [lat, lng]
+ * @param {Array<[number,number]>} ring
+ */
+export function pointInPolygon(point, ring = []) {
+  if (!Array.isArray(point) || point.length < 2) return false;
+  if (!Array.isArray(ring) || ring.length < 3) return false;
+  const [lat, lng] = point;
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return false;
+
+  let inside = false;
+  for (let i = 0, j = ring.length - 1; i < ring.length; j = i, i += 1) {
+    const a = ring[i];
+    const b = ring[j];
+    if (!Array.isArray(a) || !Array.isArray(b)) continue;
+    const [latI, lngI] = a;
+    const [latJ, lngJ] = b;
+    const straddles = latI > lat !== latJ > lat;
+    if (!straddles) continue;
+    // lng of the edge at this latitude
+    const lngAt = lngI + ((lat - latI) / (latJ - latI)) * (lngJ - lngI);
+    if (lng < lngAt) inside = !inside;
+  }
+  return inside;
+}
+
+/** Bounding box of a ring: { minLat, maxLat, minLng, maxLng } or null. */
+export function polygonBounds(ring = []) {
+  if (!Array.isArray(ring) || ring.length < 3) return null;
+  let minLat = Infinity;
+  let maxLat = -Infinity;
+  let minLng = Infinity;
+  let maxLng = -Infinity;
+  for (const p of ring) {
+    if (!Array.isArray(p) || !Number.isFinite(p[0]) || !Number.isFinite(p[1])) continue;
+    if (p[0] < minLat) minLat = p[0];
+    if (p[0] > maxLat) maxLat = p[0];
+    if (p[1] < minLng) minLng = p[1];
+    if (p[1] > maxLng) maxLng = p[1];
+  }
+  if (!Number.isFinite(minLat) || !Number.isFinite(minLng)) return null;
+  return { minLat, maxLat, minLng, maxLng };
+}
+
+/** Area-weighted centroid of a ring, as [lat,lng]. Null when degenerate. */
+export function polygonCentroid(ring = []) {
+  if (!Array.isArray(ring) || ring.length < 3) return null;
+  let latSum = 0;
+  let lngSum = 0;
+  let n = 0;
+  for (const p of ring) {
+    if (!Array.isArray(p) || !Number.isFinite(p[0]) || !Number.isFinite(p[1])) continue;
+    latSum += p[0];
+    lngSum += p[1];
+    n += 1;
+  }
+  return n ? [latSum / n, lngSum / n] : null;
+}
+
+/**
+ * A uniformly-random point that actually lies INSIDE the ring.
+ *
+ * Rejection-samples the bounding box, which is simple and correct for the convex-ish
+ * venue outlines drawn in practice. Falls back to the centroid if the ring is so
+ * thin that sampling keeps missing — better a valid point on the right spot than
+ * a point outside the coverage area, which the aggregator would discard.
+ */
+export function randomPointInPolygon(ring = [], attempts = 200) {
+  const b = polygonBounds(ring);
+  if (!b) return null;
+  for (let i = 0; i < attempts; i += 1) {
+    const lat = b.minLat + Math.random() * (b.maxLat - b.minLat);
+    const lng = b.minLng + Math.random() * (b.maxLng - b.minLng);
+    if (pointInPolygon([lat, lng], ring)) return [lat, lng];
+  }
+  const c = polygonCentroid(ring);
+  return c && pointInPolygon(c, ring) ? c : c;
+}
+
+/** Metres → degrees of latitude / longitude at a given latitude. */
+export function metresToDegrees(metres, atLat) {
+  const dLat = metres / 111132.92;
+  const dLng = metres / Math.max(1e-6, 111412.84 * Math.cos(toRad(atLat)));
+  return { dLat, dLng };
+}
+
+/**
+ * Advance a simulated walker one step: a correlated random walk (it mostly keeps
+ * going the way it was heading, with a small turn) so the resulting track looks
+ * like a person walking rather than teleporting noise. Stays inside `ring`: if a
+ * step would leave the polygon, it turns back instead.
+ *
+ * @param {{lat:number,lng:number,heading:number}} state current position + heading (deg)
+ * @param {Array<[number,number]>} ring polygon to stay inside
+ * @param {{speedMps?:number, dtSec?:number, turnDeg?:number}} [opts]
+ * @returns {{lat:number,lng:number,heading:number,speed:number}}
+ */
+export function stepWalker(state, ring = [], opts = {}) {
+  const speedMps = opts.speedMps ?? 1.3; // average walking pace
+  const dtSec = opts.dtSec ?? 4;
+  const turnDeg = opts.turnDeg ?? 35;
+
+  let heading = Number.isFinite(state.heading) ? state.heading : Math.random() * 360;
+  const distance = speedMps * dtSec;
+
+  // Try the current heading first, then progressively bigger turns, so a walker
+  // that reaches the boundary follows it instead of freezing.
+  for (let attempt = 0; attempt < 12; attempt += 1) {
+    const jitter = (Math.random() - 0.5) * turnDeg;
+    const tryHeading = (heading + jitter + attempt * 47) % 360;
+    const rad = toRad(tryHeading);
+    const { dLat, dLng } = metresToDegrees(distance, state.lat);
+    const lat = state.lat + Math.cos(rad) * dLat;
+    const lng = state.lng + Math.sin(rad) * dLng;
+    if (!ring.length || pointInPolygon([lat, lng], ring)) {
+      return { lat, lng, heading: tryHeading, speed: speedMps };
+    }
+  }
+  // Boxed in (shouldn't happen inside a sane polygon): stay put, unknown motion.
+  return { lat: state.lat, lng: state.lng, heading, speed: 0 };
+}

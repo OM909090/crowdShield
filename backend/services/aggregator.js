@@ -110,6 +110,9 @@ export function aggregate(devices = [], venue = null) {
   const { covered, outside: outsideCoverage, coverage } = filterToCoverage(devices, venue);
 
   // ---- H3 cell accumulation ----
+  // Venue-wide motion is accumulated in the same pass, so the implicit
+  // coverage-area zone (below) costs no extra iteration over the crowd.
+  const aorAcc = { count: 0, speedN: 0, sumSpeed: 0, sumSpeed2: 0, dirN: 0, sumSin: 0, sumCos: 0 };
   const cellAcc = new Map();
   for (const d of covered) {
     const cell = toCell(d.lat, d.lng, res);
@@ -119,6 +122,17 @@ export function aggregate(devices = [], venue = null) {
       cellAcc.set(cell, a);
     }
     a.count += 1;
+    aorAcc.count += 1;
+    if (Number.isFinite(d.speed)) {
+      aorAcc.speedN += 1;
+      aorAcc.sumSpeed += d.speed;
+      aorAcc.sumSpeed2 += d.speed * d.speed;
+    }
+    if (Number.isFinite(d.heading)) {
+      aorAcc.dirN += 1;
+      aorAcc.sumSin += Math.sin(d.heading * DEG2RAD);
+      aorAcc.sumCos += Math.cos(d.heading * DEG2RAD);
+    }
     // A device that hasn't reported (or moved enough to derive) speed/heading
     // contributes to the headcount only. Counting it as 0 m/s due-North would
     // invent a stalled northbound crowd out of missing data.
@@ -227,6 +241,64 @@ export function aggregate(devices = [], venue = null) {
       flowBearing: z.dirN ? Math.round(meanBearing(z.sumSin, z.sumCos, z.dirN)) : null,
     };
   });
+
+  /**
+   * The default zone: the coverage area itself.
+   *
+   * Risk is scored per zone, so an event where nobody has drawn one had no risk
+   * at all — the dashboard sat at 0%, no escalation could fire, and there was no
+   * time-to-critical. But the operator HAS already told us the area they are
+   * responsible for, so treat that boundary as a zone in its own right and the
+   * radar works from the moment coverage is drawn.
+   *
+   * The subtlety that makes this worth anything: density must NOT be the average
+   * over the whole area. Spread 34,000 people across 1.7 km² and the mean is
+   * 0.2 p/m² — "empty field" — while a gate approach inside it is at 8 p/m² and
+   * minutes from a crush. Averaging is precisely how a venue-wide number tells
+   * you everything is fine while people are being crushed. So the risk-bearing
+   * density is the WORST occupied pocket inside the boundary; the true mean is
+   * kept alongside it as `meanDensity` so nothing is hidden.
+   */
+  if (!zoneOut.length && coverage) {
+    const areaM2 = venue?.aor?.areaM2 || 0;
+    const personsEst = aorAcc.count * scale;
+    const meanDensity = areaM2 > 0 ? personsEst / areaM2 : 0;
+
+    // Worst pocket: densest cell holding more than a single stray device, so one
+    // lone phone can never define the venue's risk.
+    let peak = 0;
+    for (const c of cells) {
+      if (c.count >= 2 && c.density > peak) peak = c.density;
+    }
+    const riskDensity = peak > 0 ? peak : meanDensity;
+    const level = densityLevel(riskDensity);
+
+    zoneOut.push({
+      id: "AOR",
+      name: "Whole venue (coverage area)",
+      type: "aor",
+      areaM2,
+      capacity: 0,
+      sampleCount: aorAcc.count,
+      personsEst: Math.round(personsEst),
+      /** Drives risk: the most dangerous ground measured inside the boundary. */
+      density: round(riskDensity, 2),
+      /** Everyone spread evenly — kept so the peak above is never mistaken for it. */
+      meanDensity: round(meanDensity, 2),
+      densityBasis: peak > 0 ? "worst-pocket" : "area-average",
+      level,
+      status: levelToStatus(level),
+      loadPct: null,
+      speedSamples: aorAcc.speedN,
+      dirSamples: aorAcc.dirN,
+      meanSpeed: aorAcc.speedN ? round(aorAcc.sumSpeed / aorAcc.speedN, 2) : null,
+      speedVar: roundOrNull(variance(aorAcc.sumSpeed, aorAcc.sumSpeed2, aorAcc.speedN), 3),
+      dirCoherence: roundOrNull(coherence(aorAcc.sumSin, aorAcc.sumCos, aorAcc.dirN), 2),
+      flowBearing: aorAcc.dirN ? Math.round(meanBearing(aorAcc.sumSin, aorAcc.sumCos, aorAcc.dirN)) : null,
+      /** So the UI can say this came from the boundary, not a hand-drawn zone. */
+      implicit: true,
+    });
+  }
 
   const sampled = covered.length;
   return {

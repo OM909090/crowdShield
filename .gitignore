@@ -6,6 +6,17 @@ node_modules/
 .env.*
 !.env.example
 
+# User-uploaded files. Authority sign-up stores photographed government ID cards
+# here for admin verification — real people's identity documents. These must never
+# reach the repository.
+backend/uploads/
+
+# Mobile build artefacts (regenerate with the Android build; do not version).
+*.apk
+*.aab
+*.keystore
+apps/mobile/crowdshield-android.zip
+
 # Build outputs
 dist/
 build/

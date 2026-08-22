@@ -15,7 +15,9 @@ const pointSchema = new Schema(
 const locationSchema = new Schema(
   {
     venueName: { type: String, required: true, trim: true, maxlength: 150 },
-    address: { type: String, required: true, trim: true, maxlength: 300 },
+    // Optional: the location is picked on a map, so a full postal address is no
+    // longer required to create an event.
+    address: { type: String, trim: true, maxlength: 300 },
     coordinates: { type: pointSchema },
   },
   { _id: false }

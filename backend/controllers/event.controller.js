@@ -1,6 +1,7 @@
 import Event from "../models/Event.js";
 import ApiError from "../utils/ApiError.js";
 import asyncHandler from "../utils/asyncHandler.js";
+import { geocodeAddress } from "../utils/geocode.js";
 
 const toGeoLocation = (location) => ({
   venueName: location.venueName,
@@ -11,8 +12,28 @@ const toGeoLocation = (location) => ({
       : undefined,
 });
 
+/**
+ * Ensure the location has coordinates. The map picker normally sends them, but
+ * if it didn't (e.g. an authority typed a venue name and skipped the pin) we
+ * geocode the venue name + address server-side so the event still lands on the
+ * map. Best-effort: a geocode miss just leaves coordinates unset, exactly as
+ * before.
+ */
+const withResolvedCoordinates = async (location = {}) => {
+  const hasPin = location?.coordinates?.latitude != null && location?.coordinates?.longitude != null;
+  if (hasPin) return location;
+
+  const query = [location.venueName, location.address].filter(Boolean).join(", ");
+  const geo = await geocodeAddress(query);
+  if (!geo) return location;
+
+  return { ...location, coordinates: { latitude: geo.lat, longitude: geo.lng } };
+};
+
 export const createEvent = asyncHandler(async (req, res) => {
   const { name, type, description, startDate, endDate, location, expectedAttendance, bannerUrl } = req.body;
+
+  const resolvedLocation = await withResolvedCoordinates(location);
 
   const event = await Event.create({
     name,
@@ -22,7 +43,7 @@ export const createEvent = asyncHandler(async (req, res) => {
     endDate,
     expectedAttendance,
     bannerUrl,
-    location: toGeoLocation(location),
+    location: toGeoLocation(resolvedLocation),
     createdBy: req.user._id,
   });
 

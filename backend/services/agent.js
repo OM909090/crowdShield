@@ -31,11 +31,14 @@ import { sampleRoadCongestion } from "./roadCrowd.js";
 import RoadNetwork from "../models/RoadNetwork.js";
 import { validateActions, ACTION_SCHEMA_PROMPT } from "./actionSchema.js";
 import { tightPolygon } from "../utils/hull.js";
-import { haversineMeters } from "../utils/geo.js";
+import { haversineMeters, centroid } from "../utils/geo.js";
 import { dangerSegmentPenalties } from "./routeSafety.js";
 import { chatStream, getActiveConfig, NoProviderError } from "./llmProvider.js";
 import { alertBus } from "../realtime/alertBus.js";
 import { getIO, roomName } from "../realtime/socket.js";
+import { sendBroadcast } from "./broadcast.js";
+import { detectDangerZones } from "./dangerZones.js";
+import { broadcasterStatus } from "../realtime/broadcaster.js";
 
 const MAX_TOOL_ITERS = 2; // tool rounds; the brief answers most questions already
 const WAKE_COOLDOWN_MS = 90_000; // per-zone autonomous-wake suppression window
@@ -90,6 +93,63 @@ const lastWake = new Map();
 const lastCycleAt = new Map();
 const MIN_CYCLE_GAP_MS = 15_000;
 
+// `${eventId}:${sortedZoneIds}` -> last autonomous broadcast timestamp. A crush
+// warning is sent to the at-risk zones the instant the agent decides it, with no
+// human sign-off — but the same zones must not be re-blasted every cycle while
+// the situation stays hot, so a targeted alert to a given set of zones is
+// suppressed for this window after it fires.
+const lastAutoBroadcast = new Map();
+const AUTO_BROADCAST_COOLDOWN_MS = 60_000;
+
+/**
+ * The guardian's pulse, per event.
+ *
+ * An autonomous safety agent that works silently is indistinguishable from one
+ * that has crashed — the operator's only evidence used to be whether a proposal
+ * happened to appear. This is the heartbeat: what it is doing right now, when it
+ * last reasoned, what it decided, and which areas it warned.
+ */
+const agentStatus = new Map();
+
+export function getAgentStatus(eventId) {
+  const key = String(eventId);
+  return (
+    agentStatus.get(key) || {
+      phase: "watching",
+      lastRunAt: null,
+      severity: null,
+      trigger: null,
+      actions: 0,
+      alertedAreas: [],
+      dangerAreas: 0,
+      model: null,
+    }
+  );
+}
+
+function publishStatus(eventId, patch) {
+  const key = String(eventId);
+  const next = { ...getAgentStatus(key), ...patch, at: Date.now() };
+  agentStatus.set(key, next);
+  const io = getIO();
+  if (io) io.to(roomName(eventId)).emit("agent:status", { eventId: key, ...next });
+  return next;
+}
+
+/**
+ * Patrol cadence: how long the agent may go without looking, while an event is
+ * live and phones are reporting.
+ *
+ * The threshold triggers only fire when something is already elevated, so on a
+ * calm-but-filling venue the agent would simply sleep — and an operator watching
+ * a rising crowd would see nothing from it for an hour. A patrol means it never
+ * stops watching during the event: it re-reads the ground on this cadence even
+ * when nothing has crossed a line yet, which is also how it catches a SECOND
+ * pocket forming while the first is the one everybody is staring at.
+ */
+const PATROL_MS = 180_000;
+const patrolTimers = new Map();
+
 function claimCycle(eventId, bypass = false) {
   const key = String(eventId);
   const now = Date.now();
@@ -116,6 +176,11 @@ Operating principles:
 Who you protect, and in what order:
 - Every risk has TWO audiences: the people standing in it, and the control room. Protect the people FIRST — a phone in a pocket can move its owner in seconds, while the room takes minutes to act.
 - So for a crowd that is dense, converging, or forecast to cross a threshold, your FIRST actions are citizen-facing: a \`broadcast_alert\` that names the danger and the way out in short, calm, directive words, and a \`direct_crowd\` that pulls the people IN and APPROACHING that crowd toward the calmest open exit or a less-crowded street. Put these citizen actions before any command-side action.
+- A \`broadcast_alert\` you set to "critical" AND scope with "zoneIds" (the zones the endangered people are standing in — take the ids from TOP RISKS / WHERE) is sent to those citizens IMMEDIATELY, with NO human approval, because a crush warning that waits is worthless. This is a real power: use it the moment a crush-class threat is present or imminent, target it tightly to the zones actually at risk, and word it for a frightened person. An alert with NO zoneIds is venue-wide and still waits for the authority, so never rely on that for an urgent, localised danger — target it.
+- Flag EVERY dangerous crowd, not just the worst. If the CANDIDATES list offers several \`flag_area\` moves, and several crowds are genuinely dense or dangerous, propose a \`flag_area\` for each so the whole picture is marked on the map — a real danger left unflagged is a danger nobody was warned about.
+- SWEEP THE WHOLE COVERAGE, every pass. The brief's DANGER AREAS section lists every pocket of dangerously packed ground that exists right now, and WHERE tells you where each one sits. Work through ALL of them, not just the biggest: send one targeted \`broadcast_alert\` per dangerous area, and say in your reasoning which areas you warned and which you judged safe. The second pocket — the one nobody is looking at — is the one that kills people.
+- When no zones have been drawn, target your alerts at the DANGER AREAS ids (dz-…) or the CROWDS ids (K1, K2 …). Those people are reachable and they are the ones in danger; refusing to alert because the operator never authored a zone means nobody gets warned at all.
+- Ask for physical help where it is needed, with \`suggest_placement\`: marshals to hold and split a packed flow, a medical tent where people are collapsing or raising SOS, a water point in a stalled queue, exit signage where people cannot see the way out. Anchor each one to a crowd, danger area, gate, corridor or zone — the map turns it into a pin the operator can act on immediately. Do this whenever a crowd is dense enough that words alone will not fix it.
 - THEN propose the command-side moves for the authority to authorize — \`open_gate\` to add egress, \`close_gate\`/\`suggest_barricade\` to hold or split inflow, \`deploy_units\` for medical or marshals. Consequential moves wait for a human; the citizen alert and diversion should not wait.
 - Act on prediction, not just the present. If a crowd's growth or two groups converging will make a place dangerous soon, alert and divert BEFORE it crosses the line — and say the time-to-critical when the brief gives it. Catching it early is the whole job.
 - Name the specific crowd (its K-id) and the real place (a street or gate) in every alert, so a person on the ground can act on it. "Move away from Singhadwara Chokepoint toward Gate 1" — never "leave zone Z1".
@@ -176,7 +241,17 @@ export async function loadContext(eventId) {
     buildSnapshot(event, venue),
     RoadNetwork.findOne({ event: eventId }),
   ]);
-  return { event, venue, snapshot, roadNetwork };
+  /**
+   * The live danger pockets — every patch of ground where people are packed
+   * dangerously, computed deterministically from this tick's cells.
+   *
+   * The map has drawn these all along, but the agent could never see them, which
+   * is exactly why it kept reasoning about "the one big crowd" and missed a second
+   * pocket building on the other side of the coverage. Now the same areas the
+   * operator is looking at are in the agent's brief, with ids it can alert on.
+   */
+  const dangerZones = detectDangerZones(snapshot?.cells || []);
+  return { event, venue, snapshot, roadNetwork, dangerZones };
 }
 
 /**
@@ -314,8 +389,102 @@ function circlePolygon(center, radiusM, points = 18) {
   return ring;
 }
 
-export function withGeometry(action, venue, snapshot, roadNetwork = null) {
+/**
+ * Resolve an alert/placement target id to the ground it means.
+ *
+ * One id space, three sources: an authored zone, a live danger pocket, or a
+ * tracked crowd. Returning the polygon (and a name a human recognises) is what
+ * lets the operator's map show exactly WHICH areas the agent warned, instead of
+ * an alert that exists only as text in a list.
+ */
+function resolveArea(id, venue, snapshot, dangerZones = []) {
+  const zone = (venue?.zones || []).find((z) => z.id === id);
+  if (zone?.polygon?.length >= 3) {
+    return { id, name: zone.name || id, kind: "zone", polygon: zone.polygon, center: centroid(zone.polygon) };
+  }
+  const dz = (dangerZones || []).find((d) => d.id === id);
+  if (dz?.polygon?.length >= 3) {
+    return {
+      id,
+      name: `danger area (${dz.severity}, ~${dz.personsEst} people)`,
+      kind: "danger",
+      polygon: dz.polygon,
+      center: dz.centroid || centroid(dz.polygon),
+      personsEst: dz.personsEst,
+      severity: dz.severity,
+    };
+  }
+  const cluster = (snapshot?.clusters || []).find((k) => k.id === id);
+  if (cluster?.centroid) {
+    return {
+      id,
+      name: `crowd ${id} (~${cluster.personsEst} people)`,
+      kind: "crowd",
+      polygon: circlePolygon(cluster.centroid, Math.min(cluster.radiusM || 60, 120)),
+      center: cluster.centroid,
+      personsEst: cluster.personsEst,
+    };
+  }
+  return null;
+}
+
+export function withGeometry(action, venue, snapshot, roadNetwork = null, dangerZones = []) {
   if (!action || !venue) return action;
+
+  // A placement suggestion becomes a pin the operator can act on: resolve the
+  // anchor the agent named into an actual coordinate. Coordinates are never taken
+  // from the model, so a suggestion cannot land on ground that does not exist.
+  if (action.type === "suggest_placement") {
+    let at = null;
+    let targetName = null;
+    if (action.clusterId) {
+      const k = (snapshot?.clusters || []).find((c) => c.id === action.clusterId);
+      if (k?.centroid) {
+        at = k.centroid;
+        targetName = `crowd ${k.id} (~${k.personsEst} people)`;
+      }
+    }
+    if (!at && action.areaId) {
+      const d = (dangerZones || []).find((x) => x.id === action.areaId);
+      if (d?.centroid) {
+        at = d.centroid;
+        targetName = `danger area (~${d.personsEst} people)`;
+      }
+    }
+    if (!at && action.nodeId) {
+      const n = (venue.nodes || []).find((x) => x.id === action.nodeId);
+      if (n?.at) {
+        at = n.at;
+        targetName = n.name || n.id;
+      }
+    }
+    if (!at && action.edgeId) {
+      const e = (venue.edges || []).find((x) => x.id === action.edgeId);
+      const path = e?.path || [];
+      if (path.length) {
+        at = path[Math.floor(path.length / 2)];
+        targetName = e.name || e.id;
+      }
+    }
+    if (!at && action.zoneId) {
+      const z = (venue.zones || []).find((x) => x.id === action.zoneId);
+      if (z?.polygon?.length >= 3) {
+        at = centroid(z.polygon);
+        targetName = z.name || z.id;
+      }
+    }
+    return at ? { ...action, at, targetName } : action;
+  }
+
+  // A targeted alert carries the polygons it was sent to, so the command map can
+  // flag the exact areas the agent warned and the operator can SEE it working.
+  if (action.type === "broadcast_alert" && Array.isArray(action.zoneIds) && action.zoneIds.length) {
+    const areas = action.zoneIds
+      .map((id) => resolveArea(id, venue, snapshot, dangerZones))
+      .filter(Boolean);
+    if (areas.length) return { ...action, areas };
+    return action;
+  }
 
   // A flagged danger area is drawn around the live crowd it names: resolve the
   // K-id to that crowd's footprint (centroid + radius) so the map has a polygon.
@@ -413,7 +582,7 @@ export function withGeometry(action, venue, snapshot, roadNetwork = null) {
     return action;
   }
 
-  if ((action.type === "highlight_zone" || action.type === "set_camera") && action.zoneId) {
+  if (action.type === "highlight_zone" && action.zoneId) {
     const zone = (venue.zones || []).find((z) => z.id === action.zoneId);
     if (zone) {
       return { ...action, zoneName: zone.name, polygon: zone.polygon };
@@ -448,6 +617,89 @@ export function serializeProposal(p) {
 }
 
 /**
+ * Autonomously send the citizen-facing warnings that must not wait for a human:
+ * a `broadcast_alert` that is CRITICAL *and* zone-targeted. Mutates the matching
+ * actions' status to "executed" in place (the caller persists) and returns
+ * whether anything was sent.
+ *
+ * The two guards are deliberate. "critical" is the model's own severity read, so
+ * the agent only auto-fires when it judged the situation a crush-class threat.
+ * Zone-targeting means the blast is scoped to the people actually at risk, never
+ * the whole venue — a wrong venue-wide alert is its own emergency, so those still
+ * need a human. A per-(event, zones) cooldown stops the same zones being
+ * re-warned every cycle while a hotspot persists.
+ */
+/**
+ * Severities that earn an immediate, un-approved citizen warning.
+ *
+ * "critical" alone was too strict, and a live test proved it: a chokepoint at
+ * 7.99 p/m² with 39 SECONDS to critical produced a correctly-targeted alert that
+ * the model labelled "high" — so it queued for a human and the people standing in
+ * it were never told anything. A crush does not wait for the adjective to be
+ * upgraded. Targeting is what makes this safe (the warning only reaches the
+ * people in that specific area, and it only ever tells them to move), so the bar
+ * for sending is the danger being real and localised, not the wording being
+ * maximal. Venue-wide alerts still need a human.
+ */
+const AUTO_SEND_SEVERITIES = new Set(["high", "critical"]);
+
+async function autoSendCriticalBroadcasts({ event, proposal, severity, venue, snapshot, dangerZones }) {
+  if (!AUTO_SEND_SEVERITIES.has(severity)) return false;
+
+  let sent = false;
+  for (const action of proposal.actions) {
+    if (action.type !== "broadcast_alert" || action.status === "executed") continue;
+
+    const params = action.params || {};
+    const zoneIds = Array.isArray(params.zoneIds) ? params.zoneIds.filter(Boolean) : [];
+    if (!zoneIds.length) continue; // untargeted → still needs human sign-off
+
+    const key = `${event._id}:${[...zoneIds].sort().join(",")}`;
+    const now = Date.now();
+    if (now - (lastAutoBroadcast.get(key) || 0) < AUTO_BROADCAST_COOLDOWN_MS) continue;
+    lastAutoBroadcast.set(key, now);
+
+    try {
+      await sendBroadcast({
+        eventId: event._id,
+        // A "high" assessment is still a warning people must act on; the Broadcast
+        // model speaks info|warning|critical, so map honestly rather than inflating.
+        message: params.message,
+        severity: severity === "critical" ? "critical" : "warning",
+        source: "agent",
+        cohorts: params.cohorts,
+        zoneIds,
+        proposalId: proposal._id,
+      });
+      action.status = "executed";
+      action.result = `auto-sent to ${zoneIds.length} area(s): ${zoneIds.join(", ")}`;
+      sent = true;
+
+      // Tell the command map WHICH ground was just warned, with the polygons, so
+      // the authority can see the agent working instead of taking it on trust.
+      const io = getIO();
+      if (io) {
+        const areas = zoneIds
+          .map((zid) => resolveArea(zid, venue, snapshot, dangerZones))
+          .filter(Boolean);
+        io.to(roomName(event._id)).emit("agent:alerted", {
+          proposalId: String(proposal._id),
+          message: params.message,
+          severity,
+          at: Date.now(),
+          areas,
+        });
+      }
+    } catch (err) {
+      action.status = "failed";
+      action.result = `autonomous send failed: ${err.message}`;
+      console.error(`[agent] autonomous broadcast failed for event ${event._id}:`, err.message);
+    }
+  }
+  return sent;
+}
+
+/**
  * One reasoning pass for an event. Builds the brief, reasons (with tools),
  * validates the proposed actions against the venue graph, persists the
  * proposal (advisory actions marked applied, consequential ones pending), and
@@ -456,11 +708,27 @@ export function serializeProposal(p) {
  * @returns {{ proposal, invalid: Array }}
  * @throws {NoProviderError} when no LLM provider is configured.
  */
-export async function runAgentCycle({ event, venue, snapshot, roadNetwork = null, trigger = "manual" }) {
+export async function runAgentCycle({
+  event,
+  venue,
+  snapshot,
+  roadNetwork = null,
+  dangerZones = [],
+  trigger = "manual",
+}) {
   const cfg = await getActiveConfig();
   if (!cfg) throw new NoProviderError("No LLM provider configured");
 
-  const brief = buildBrief({ event, venue, snapshot, roadNetwork, trigger });
+  // Visible thinking. The operator sees the guardian pick up the situation the
+  // moment it does, not several seconds later when a proposal lands.
+  publishStatus(event._id, {
+    phase: "thinking",
+    trigger: typeof trigger === "string" ? trigger : trigger?.type || "alert",
+    dangerAreas: (dangerZones || []).length,
+    model: cfg.model,
+  });
+
+  const brief = buildBrief({ event, venue, snapshot, roadNetwork, dangerZones, trigger });
   const result = await reason({ brief, venue, snapshot, roadNetwork });
 
   // A reply we couldn't read is a FAILED pass, not a calm one. The old code
@@ -488,6 +756,7 @@ export async function runAgentCycle({ event, venue, snapshot, roadNetwork = null
   const { valid } = validateActions(Array.isArray(envelope.actions) ? envelope.actions : [], venue || {}, {
     roadNetwork,
     clusters: snapshot?.clusters || [],
+    dangerZones,
   });
 
   const actions = valid.map((a) => {
@@ -510,6 +779,26 @@ export async function runAgentCycle({ event, venue, snapshot, roadNetwork = null
     parseFailed,
   });
 
+  // Protect the people first. A CRITICAL, ZONE-TARGETED broadcast is the one
+  // consequential move that cannot wait for a human: a crush warning that queues
+  // for sign-off is useless to the person already in the crush. So we send those
+  // — and only those — autonomously, straight to the citizens in the named
+  // zones, and mark the action executed. Everything else (venue-wide alerts,
+  // gates, unit moves) still queues for authority approval. The proposal remains
+  // the audit trail / proof of exactly what was auto-sent, to which zones, why.
+  const autoSent = await autoSendCriticalBroadcasts({
+    event,
+    proposal,
+    severity,
+    venue,
+    snapshot,
+    dangerZones,
+  });
+  if (autoSent) {
+    proposal.markModified("actions");
+    await proposal.save();
+  }
+
   // Push live to the command dashboard; advisory actions also announce
   // themselves so the map can react immediately.
   const io = getIO();
@@ -519,10 +808,26 @@ export async function runAgentCycle({ event, venue, snapshot, roadNetwork = null
     for (const a of payload.actions.filter((x) => x.klass === "advisory")) {
       io.to(roomName(event._id)).emit("agent:action", {
         proposalId: payload._id,
-        action: withGeometry(a, venue, snapshot, roadNetwork),
+        action: withGeometry(a, venue, snapshot, roadNetwork, dangerZones),
       });
     }
   }
+
+  // Close the loop on "is the agent even working?" — the operator now sees the
+  // guardian's pulse: when it last thought, what it concluded, how many areas it
+  // warned, and that it is still watching.
+  publishStatus(event._id, {
+    phase: "idle",
+    lastRunAt: Date.now(),
+    severity,
+    trigger: typeof trigger === "string" ? trigger : trigger?.type || "alert",
+    actions: actions.length,
+    alertedAreas: actions
+      .filter((a) => a.type === "broadcast_alert" && a.status === "executed")
+      .flatMap((a) => a.params?.zoneIds || []),
+    dangerAreas: dangerZones.length,
+    model: cfg.model,
+  });
 
   return { proposal };
 }
@@ -598,4 +903,59 @@ export function initAgent() {
     }
   });
   console.log("[agent] subscribed to alertBus (autonomous wake armed: zones + crowd conditions)");
+  startPatrol();
+  console.log(`[agent] patrol armed: re-reads every live event every ${PATROL_MS / 1000}s (never sleeps mid-event)`);
+}
+
+/**
+ * The never-sleeping half of the guardian.
+ *
+ * Threshold triggers answer "something just got bad". A patrol answers the
+ * question an operator actually asks — "are you still watching?" — and catches
+ * the slow build that never trips a threshold, plus the second and third pocket
+ * forming away from the one everyone is looking at.
+ *
+ * Deliberately cheap and self-limiting: it only runs for events that are
+ * genuinely live (a broadcaster loop running, phones reporting), it reuses the
+ * same cycle guard as every other wake, and it skips entirely when no LLM
+ * provider is configured.
+ */
+export function startPatrol() {
+  if (patrolTimers.has("global")) return;
+  const timer = setInterval(async () => {
+    try {
+      const cfg = await getActiveConfig();
+      if (!cfg) return; // no provider → Tier 0/1 keep working, agent stays quiet
+
+      // Only events somebody is actually watching have a live picture to read.
+      for (const s of broadcasterStatus()) {
+        if (!s.running) continue;
+        const eventId = s.eventId;
+
+        const last = lastCycleAt.get(String(eventId)) || 0;
+        if (Date.now() - last < PATROL_MS) continue; // a trigger already looked recently
+
+        const ctx = await loadContext(eventId);
+        // Nothing measured = nothing to reason about; the brief would only invite
+        // invention, so stay silent but keep the pulse visible.
+        if (!ctx || !(ctx.snapshot?.totals?.sampledDevices > 0)) {
+          if (ctx) publishStatus(eventId, { phase: "watching" });
+          continue;
+        }
+        if (!claimCycle(eventId)) continue;
+
+        await runAgentCycle({ ...ctx, trigger: { type: "patrol", reason: "scheduled sweep of the whole coverage" } });
+      }
+    } catch (err) {
+      if (err?.code !== "NO_PROVIDER") console.error("[agent] patrol failed:", err.message);
+    }
+  }, PATROL_MS);
+  if (timer.unref) timer.unref();
+  patrolTimers.set("global", timer);
+}
+
+export function stopPatrol() {
+  const t = patrolTimers.get("global");
+  if (t) clearInterval(t);
+  patrolTimers.delete("global");
 }

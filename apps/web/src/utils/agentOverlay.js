@@ -10,8 +10,11 @@
 
 const MAX_HIGHLIGHTS = 4; // most recent flagged zones worth outlining at once
 const MAX_ROUTES = 3; // more than this and the map turns into spaghetti
+const MAX_FLAGGED = 6; // agent-drawn danger areas
+const MAX_BARRICADES = 8; // suggested barricade points
+const MAX_PLACEMENTS = 8; // assets the agent asks the authority to place
 
-const HIGHLIGHT_TYPES = new Set(["highlight_zone", "set_camera"]);
+const HIGHLIGHT_TYPES = new Set(["highlight_zone"]);
 
 /** Is this a usable [[lat,lng], …] ring? */
 const isPolygon = (p) => Array.isArray(p) && p.length >= 3;
@@ -39,9 +42,64 @@ export function deriveAgentOverlay(agentActions = [], venue = null) {
   const seenZones = new Set();
   const agentRoutes = [];
   const seenRoutes = new Set();
+  // Agent-drawn danger areas (flag_area) and suggested barricade points.
+  const flaggedAreas = [];
+  const seenFlags = new Set();
+  const barricades = [];
+  const seenBarr = new Set();
+  // Things the agent is asking the authority to physically PLACE — marshals, a
+  // medical tent, water, signage. Each carries a server-resolved point, so it
+  // lands on real ground rather than wherever a model guessed.
+  const placements = [];
+  const seenPlace = new Set();
 
   for (const a of Array.isArray(agentActions) ? agentActions : []) {
     if (!a?.type) continue;
+
+    if (a.type === "suggest_placement" && isLatLng(a.at)) {
+      const key = `${a.kind}:${a.clusterId || a.areaId || a.nodeId || a.edgeId || a.zoneId || placements.length}`;
+      if (seenPlace.has(key) || placements.length >= MAX_PLACEMENTS) continue;
+      seenPlace.add(key);
+      placements.push({
+        id: `${a.proposalId || "agent"}-place-${key}`,
+        kind: a.kind,
+        at: a.at,
+        targetName: a.targetName || "",
+        reason: a.reason || "",
+      });
+      continue;
+    }
+
+    // A danger area the agent drew around a live crowd — server attaches the
+    // polygon (a circle over the crowd's footprint) via withGeometry.
+    if (a.type === "flag_area" && isPolygon(a.polygon)) {
+      const key = a.clusterId || `${flaggedAreas.length}`;
+      if (seenFlags.has(key) || flaggedAreas.length >= MAX_FLAGGED) continue;
+      seenFlags.add(key);
+      flaggedAreas.push({
+        id: `${a.proposalId || "agent"}-flag-${key}`,
+        clusterId: a.clusterId,
+        polygon: a.polygon,
+        severity: a.severity || "high",
+        personsEst: Number.isFinite(Number(a.personsEst)) ? Number(a.personsEst) : null,
+        label: `AI danger area${Number.isFinite(Number(a.personsEst)) ? ` · ~${Number(a.personsEst)}` : ""}`,
+      });
+      continue;
+    }
+
+    // A suggested barricade — server attaches the point (`at`) to pin on the map.
+    if (a.type === "suggest_barricade" && isLatLng(a.at)) {
+      const key = a.edgeId || a.nodeId || `${barricades.length}`;
+      if (seenBarr.has(key) || barricades.length >= MAX_BARRICADES) continue;
+      seenBarr.add(key);
+      barricades.push({
+        id: `${a.proposalId || "agent"}-barr-${key}`,
+        at: a.at,
+        label: a.targetName || a.edgeId || a.nodeId || "barricade",
+        reason: a.reason || "",
+      });
+      continue;
+    }
 
     if (HIGHLIGHT_TYPES.has(a.type) && a.zoneId) {
       if (seenZones.has(a.zoneId) || highlightZones.length >= MAX_HIGHLIGHTS) continue;
@@ -80,7 +138,7 @@ export function deriveAgentOverlay(agentActions = [], venue = null) {
     }
   }
 
-  return { highlightZones, agentRoutes };
+  return { highlightZones, agentRoutes, flaggedAreas, barricades, placements };
 }
 
 /* ------------------------------------------------------------------ *
@@ -89,9 +147,11 @@ export function deriveAgentOverlay(agentActions = [], venue = null) {
 
 const ACTION_LABELS = {
   highlight_zone: "Flagged zone",
-  set_camera: "Camera on zone",
   draw_route: "Routed crowd",
   set_routing_policy: "Corridor direction",
+  flag_area: "Flagged danger area",
+  suggest_barricade: "Suggested barricade",
+  suggest_placement: "Asked authority to place",
   open_gate: "Opened gate",
   close_gate: "Closed gate",
   deploy_units: "Deployed units",
@@ -108,12 +168,19 @@ export function actionTarget(a) {
   if (!a) return "";
   switch (a.type) {
     case "highlight_zone":
-    case "set_camera":
       return a.zoneName || a.zoneId || "";
     case "draw_route":
       return a.fromNodeId && a.toNodeId ? `${a.fromNodeId} → ${a.toNodeId}` : "";
     case "set_routing_policy":
       return [a.edgeId, a.direction].filter(Boolean).join(" · ");
+    case "flag_area":
+      return [a.clusterId, Number.isFinite(Number(a.personsEst)) ? `~${Number(a.personsEst)} people` : ""]
+        .filter(Boolean)
+        .join(" · ");
+    case "suggest_barricade":
+      return [a.targetName || a.edgeId || a.nodeId, a.reason].filter(Boolean).join(" · ");
+    case "suggest_placement":
+      return [String(a.kind || "").replace(/_/g, " "), a.targetName, a.reason].filter(Boolean).join(" · ");
     case "open_gate":
     case "close_gate":
       return a.gateId || "";

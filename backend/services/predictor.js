@@ -20,7 +20,16 @@ const HORIZON_S = 600; // forecast horizon (10 min)
 export const LEVELS = ["NORMAL", "WATCH", "ELEVATED", "HIGH", "CRITICAL"];
 const PROMOTE = [0, 0.3, 0.5, 0.68, 0.82]; // risk needed to sit at level i
 const HYST = 0.08; // must fall this far below to demote (anti-flapping)
-const SUSTAIN = 3; // consecutive ticks required to promote (anti-spike)
+/**
+ * How long a breach must persist before promoting a level (anti-spike).
+ *
+ * Measured in SECONDS, not ticks. It used to count ticks and assume they arrived
+ * once a second; under a large crowd a pass can take many seconds, so "3 ticks"
+ * silently became half a minute of sustained danger before anything escalated —
+ * the venue was packed and the alert feed still said "all zones nominal". Time is
+ * what the safety property is actually about, so time is what we count.
+ */
+const SUSTAIN_S = 3;
 const CONF_MIN = 0.5; // below this confidence, cap at WATCH
 const CONF_SAMPLES = 8; // sampled devices for full confidence
 const PRESSURE_REF = 2.0; // normaliser for density × speed-variance
@@ -39,7 +48,7 @@ class ZoneTracker {
     this.holt = new Holt({ alpha: 0.5, beta: 0.3 });
     this.level = 0;
     this.pending = null;
-    this.pendingTicks = 0;
+    this.pendingSeconds = 0;
     this.stateSince = Date.now();
   }
 }
@@ -100,7 +109,7 @@ function scoreZone(z, eta) {
 }
 
 /** Debounced state machine: hysteresis + sustained-breach + confidence + multi-signal CRITICAL. */
-function stepState(tr, risk, confidence, factors) {
+function stepState(tr, risk, confidence, factors, stepSeconds = 1) {
   let desired = 0;
   for (let i = 1; i < PROMOTE.length; i += 1) if (risk >= PROMOTE[i]) desired = i;
 
@@ -110,24 +119,25 @@ function stepState(tr, risk, confidence, factors) {
   if (confidence < CONF_MIN) desired = Math.min(desired, 1);
 
   const from = tr.level;
+  const step = Number.isFinite(stepSeconds) && stepSeconds > 0 ? stepSeconds : 1;
   if (desired > tr.level) {
-    if (tr.pending === desired) tr.pendingTicks += 1;
+    if (tr.pending === desired) tr.pendingSeconds += step;
     else {
       tr.pending = desired;
-      tr.pendingTicks = 1;
+      tr.pendingSeconds = step;
     }
-    if (tr.pendingTicks >= SUSTAIN) {
+    if (tr.pendingSeconds >= SUSTAIN_S) {
       tr.level = desired;
       tr.pending = null;
-      tr.pendingTicks = 0;
+      tr.pendingSeconds = 0;
     }
   } else if (desired < tr.level && risk < PROMOTE[tr.level] - HYST) {
-    tr.level = Math.max(desired, tr.level - 1); // ease down one level/tick
+    tr.level = Math.max(desired, tr.level - 1); // ease down one level at a time
     tr.pending = null;
-    tr.pendingTicks = 0;
+    tr.pendingSeconds = 0;
   } else {
     tr.pending = null;
-    tr.pendingTicks = 0;
+    tr.pendingSeconds = 0;
   }
 
   if (tr.level !== from) tr.stateSince = Date.now();
@@ -159,7 +169,7 @@ export function advance(eventId, zones = [], { stepSeconds = 1 } = {}) {
     const projectedDensity = tr.holt.forecast(Math.round(HORIZON_S / stepSeconds));
 
     const { risk, confidence, factors } = scoreZone(z, eta);
-    const from = stepState(tr, risk, confidence, factors);
+    const from = stepState(tr, risk, confidence, factors, stepSeconds);
 
     const decoratedZone = {
       ...z,

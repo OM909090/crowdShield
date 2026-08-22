@@ -22,7 +22,9 @@ export const createEventValidator = [
     }),
 
   body("location.venueName").trim().notEmpty().withMessage("Venue name is required"),
-  body("location.address").trim().notEmpty().withMessage("Address is required"),
+  // Address is optional now that a location is picked on a map — a pin (or a
+  // geocoded venue name) is enough to place the event.
+  body("location.address").optional({ checkFalsy: true }).trim().isLength({ max: 300 }),
   body("location.coordinates.latitude").optional({ nullable: true }).isFloat({ min: -90, max: 90 }),
   body("location.coordinates.longitude").optional({ nullable: true }).isFloat({ min: -180, max: 180 }),
 

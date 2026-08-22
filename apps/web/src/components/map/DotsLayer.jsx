@@ -77,7 +77,14 @@ export default function DotsLayer({ dots = [] }) {
       const size = map.getSize();
       ctx.clearRect(0, 0, size.x, size.y);
       const alpha = Math.min(1, (performance.now() - st.t0) / TICK_MS);
-      ctx.globalAlpha = 0.85;
+      // A handful of real phones is not a simulated swarm: at 2.6px a lone dot is
+      // nearly invisible on a venue-scale map — the "I shared my location but
+      // can't see myself" case. Below a small threshold, draw a larger dot with a
+      // bright ring so every individual is findable; at scale, keep the tiny,
+      // ring-less dot for the density read and canvas performance.
+      const sparse = st.anim.size <= 150;
+      const radius = sparse ? 4 : 2.6;
+      ctx.globalAlpha = 0.9;
       for (const a of st.anim.values()) {
         const lat = a.fromLat + (a.toLat - a.fromLat) * alpha;
         const lng = a.fromLng + (a.toLng - a.fromLng) * alpha;
@@ -85,8 +92,13 @@ export default function DotsLayer({ dots = [] }) {
         if (p.x < -8 || p.y < -8 || p.x > size.x + 8 || p.y > size.y + 8) continue; // cull offscreen
         ctx.fillStyle = speedColor(a.s);
         ctx.beginPath();
-        ctx.arc(p.x, p.y, 2.6, 0, Math.PI * 2);
+        ctx.arc(p.x, p.y, radius, 0, Math.PI * 2);
         ctx.fill();
+        if (sparse) {
+          ctx.lineWidth = 1.5;
+          ctx.strokeStyle = "rgba(255,255,255,0.85)";
+          ctx.stroke();
+        }
       }
       ctx.globalAlpha = 1;
     };

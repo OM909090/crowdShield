@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useParams, useNavigate } from "react-router-dom";
 import {
   Users,
@@ -13,13 +13,58 @@ import {
   RadioTower,
   MapPinned,
   Smartphone,
+  Bell,
+  Bot,
+  ShieldCheck,
+  Megaphone,
+  LocateFixed,
 } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 import toast from "react-hot-toast";
 import api from "../utils/axios";
+import { pointInPolygon } from "../utils/geoClient";
 import { useCrowdFeed } from "../hooks/useCrowdFeed";
 import LiveCrowdMap from "../components/map/LiveCrowdMap";
-import { riskMeta, riskRank, formatEta } from "../utils/riskUi";
+import PersonalRoutePanel from "../components/map/PersonalRoutePanel";
+import AlertsFeed from "../components/AlertsFeed";
+import { riskMeta, riskRank, formatEta, timeAgo } from "../utils/riskUi";
+
+/**
+ * Anonymised device identity. The SAME localStorage key the citizen app uses, on
+ * purpose: one browser must count as one phone whichever surface it reports
+ * from, or a person opening both would be double-counted as two people.
+ */
+const DEVICE_KEY = "crowdshield:deviceHash";
+
+function getDeviceHash() {
+  try {
+    let hash = localStorage.getItem(DEVICE_KEY);
+    if (!hash) {
+      hash =
+        typeof crypto !== "undefined" && crypto.randomUUID
+          ? crypto.randomUUID()
+          : `dev-${Math.random().toString(36).slice(2)}-${Date.now()}`;
+      localStorage.setItem(DEVICE_KEY, hash);
+    }
+    return hash;
+  } catch {
+    return `dev-${Math.random().toString(36).slice(2)}-${Date.now()}`;
+  }
+}
+
+const HEARTBEAT_MS = 4000;
+// How often we re-read position. We POLL getCurrentPosition rather than lean on
+// watchPosition: on desktops watchPosition frequently never fires its first
+// high-accuracy callback (so "live" silently captured nothing), while
+// getCurrentPosition returns a fix reliably — it's the call the working
+// "use my location" button uses.
+const GEO_POLL_MS = 5000;
+
+const BROADCAST_TONE = {
+  info: "border-cyan-400/25 bg-cyan-500/10 text-cyan-100",
+  warning: "border-amber-400/30 bg-amber-500/10 text-amber-100",
+  critical: "border-red-400/35 bg-red-500/15 text-red-100",
+};
 
 const DEFAULT_CENTER = [20.2961, 85.8245];
 const HOTSPOT_LEVELS = new Set(["ELEVATED", "HIGH", "CRITICAL"]);
@@ -90,7 +135,36 @@ export default function CrowdMonitoring() {
   const [seed, setSeed] = useState(null); // first paint, replaced by the socket
   const [loading, setLoading] = useState(true);
 
-  const { frame, status } = useCrowdFeed(id);
+  /* ---- being counted, not just watching ----
+     This page used to be read-only, which is why it reported "0 phones" to
+     someone who was standing in the crowd looking at it: nothing here ever asked
+     for a location or sent a heartbeat. Sharing turns the browser into one of the
+     sensors the rest of the page is measuring. */
+  const [sharing, setSharing] = useState(false);
+  const [coords, setCoords] = useState(null);
+  const [geoDenied, setGeoDenied] = useState(false);
+  // A human-readable reason location sharing failed (denied, no HTTPS, no fix…),
+  // so the button can say WHY instead of silently doing nothing.
+  const [geoError, setGeoError] = useState(null);
+  // Live proof that sharing is actually working. Without these, "share my
+  // location" was a black box: no fix, a rejected heartbeat and a working feed
+  // all looked identical on screen.
+  const [accuracyM, setAccuracyM] = useState(null);
+  const [lastSentAt, setLastSentAt] = useState(null);
+  const [sendError, setSendError] = useState(null);
+  const coordsRef = useRef(null);
+
+  // Announcements pushed live arrive on the socket; the recent ones are fetched
+  // so somebody opening the page mid-event still sees what the crowd was told.
+  const [seedBroadcasts, setSeedBroadcasts] = useState([]);
+
+  // Authority-placed annotation pins (safe zones, medical tents, barricades…).
+  // These live behind a separate REST endpoint, not the crowd frame, so the
+  // attendee map has to fetch them the same way the command centre does — that
+  // is why they were showing on the authority map but not here.
+  const [markers, setMarkers] = useState([]);
+
+  const { frame, status, alerts, broadcasts, clusters, clusterEvents, alertedAreas } = useCrowdFeed(id);
 
   useEffect(() => {
     const load = async () => {
@@ -112,6 +186,137 @@ export default function CrowdMonitoring() {
     };
     load();
   }, [id]);
+
+  // Recent announcements so someone opening the page mid-event sees what the
+  // crowd was already told; live ones then arrive over the socket.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await api.get(`/events/${id}/broadcasts`);
+        if (!cancelled) setSeedBroadcasts(res.data?.broadcasts || []);
+      } catch {
+        if (!cancelled) setSeedBroadcasts([]);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [id]);
+
+  // Authority annotation markers — fetched once, same endpoint the command
+  // centre uses, so both maps show the same pins.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await api.get(`/events/${id}/markers`);
+        if (!cancelled) setMarkers(res.data?.markers || []);
+      } catch {
+        if (!cancelled) setMarkers([]);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [id]);
+
+  // Phone-as-sensor: while sharing, stream anonymised GPS to the same /ingest
+  // path the mobile app uses, so this browser is counted like any other phone —
+  // which is the whole reason the page can now say more than "0 phones".
+  useEffect(() => {
+    if (!sharing) return undefined;
+    if (!navigator.geolocation) {
+      setGeoDenied(true);
+      setSharing(false);
+      return undefined;
+    }
+    const hash = getDeviceHash();
+    const onFix = (pos) => {
+      const c = pos.coords;
+      const fix = {
+        lat: c.latitude,
+        lng: c.longitude,
+        heading: Number.isFinite(c.heading) ? c.heading : undefined,
+        speed: Number.isFinite(c.speed) ? c.speed : undefined,
+      };
+      coordsRef.current = fix;
+      setCoords(fix);
+      setAccuracyM(Number.isFinite(c.accuracy) ? Math.round(c.accuracy) : null);
+      setGeoError(null); // a good fix clears any earlier "retrying…" note
+    };
+    const onErr = (err) => {
+      // 1 = permission denied (permanent until the user re-allows), 2 = position
+      // unavailable, 3 = timeout. Only a denial should stop us; the others are
+      // transient, so keep the watch alive but tell the user what's happening —
+      // the old code handled only code 1, so a timeout left the button saying
+      // "sharing… live" while nothing was ever sent.
+      if (err?.code === 1) {
+        setGeoDenied(true);
+        setSharing(false);
+        setGeoError("Location permission denied. Allow location for this site in your browser, then try again.");
+        toast("Location permission denied — you can still monitor the crowd.", { icon: "📍" });
+      } else if (err?.code === 3) {
+        setGeoError("Still trying to get a location fix… (move near a window or check location is on)");
+      } else {
+        setGeoError("Location is unavailable right now — retrying…");
+      }
+    };
+    // PRIMARY: poll getCurrentPosition. maximumAge lets a poll reuse a recent
+    // fix (cheap, battery-friendly), and this is the call that actually returns
+    // on a desktop — so "live" keeps updating even when watchPosition never does.
+    const geoOpts = { enableHighAccuracy: true, timeout: 15000, maximumAge: 8000 };
+    const readNow = () => navigator.geolocation.getCurrentPosition(onFix, onErr, geoOpts);
+    readNow(); // immediate first fix so the pin + dot appear right away
+    const geoInterval = setInterval(readNow, GEO_POLL_MS);
+
+    // BONUS: a watch catches real movement between polls (mainly on phones). If
+    // it never fires (common on desktops), the poll above already covers us, so
+    // we never depend on it.
+    let watchId = null;
+    try {
+      watchId = navigator.geolocation.watchPosition(onFix, onErr, {
+        enableHighAccuracy: true,
+        maximumAge: 3000,
+        timeout: 27000,
+      });
+    } catch {
+      watchId = null;
+    }
+
+    const send = () => {
+      const fix = coordsRef.current;
+      if (!fix) return;
+      api
+        .post(`/events/${id}/ingest`, {
+          heartbeats: [{ deviceHash: hash, lat: fix.lat, lng: fix.lng, heading: fix.heading ?? undefined, speed: fix.speed ?? undefined }],
+        })
+        .then(() => {
+          setLastSentAt(Date.now());
+          setSendError(null);
+        })
+        .catch((err) => {
+          // Never silent again. A safety feature that fails without saying so is
+          // worse than one that is plainly broken — this is exactly how "share my
+          // location" could look active while nothing was ever recorded.
+          const code = err.response?.status;
+          setSendError(
+            code === 401
+              ? "Your session expired — sign in again to be counted."
+              : `Couldn't send your location${code ? ` (error ${code})` : " — network unreachable"}.`
+          );
+        });
+    };
+    const sendInterval = setInterval(send, HEARTBEAT_MS);
+    return () => {
+      if (watchId != null) navigator.geolocation.clearWatch(watchId);
+      clearInterval(geoInterval);
+      clearInterval(sendInterval);
+      setLastSentAt(null);
+      setSendError(null);
+      setAccuracyM(null);
+    };
+  }, [sharing, id]);
 
   // The socket frame wins the moment it arrives; the snapshot only fills the gap.
   const live = frame || seed;
@@ -138,6 +343,51 @@ export default function CrowdMonitoring() {
     : DEFAULT_CENTER;
 
   const badge = FEED_BADGE[status] || FEED_BADGE.connecting;
+
+  // Announcements: live socket pushes first, then the seeded history, de-duped.
+  const announcements = useMemo(() => {
+    const byId = new Map();
+    for (const b of [...(broadcasts || []), ...seedBroadcasts]) {
+      if (!b) continue;
+      const key = b.id || `${b.createdAt}|${b.message}`;
+      if (!byId.has(key)) byId.set(key, b);
+    }
+    // Which of these warnings is about the ground I am standing on? An alert
+    // aimed at my area has to be unmissable — a generic list treats "crowding is
+    // building where YOU are" exactly like a lost-property notice.
+    const myAreaIds = new Set(
+      (alertedAreas || [])
+        .filter((a) => coords && a.polygon?.length >= 3 && pointInPolygon([coords.lat, coords.lng], a.polygon))
+        .map((a) => a.id)
+    );
+    return [...byId.values()]
+      .map((b) => ({
+        ...b,
+        forMe: Array.isArray(b.zoneIds) && b.zoneIds.some((z) => myAreaIds.has(z)),
+      }))
+      .sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0))
+      .slice(0, 8);
+  }, [broadcasts, seedBroadcasts, alertedAreas, coords]);
+
+  const enableSharing = () => {
+    if (!navigator.geolocation) {
+      setGeoError("This browser can't share location.");
+      toast.error("Geolocation is not supported by this browser");
+      return;
+    }
+    // Browsers only expose GPS in a secure context. localhost counts as secure,
+    // but a plain http:// LAN address — exactly what you hit testing on a phone
+    // at http://192.168.x.x:5173 — does not, and the request is silently refused.
+    // Say so up front instead of spinning on a permission prompt that never comes.
+    if (!window.isSecureContext) {
+      setGeoError("Location needs a secure connection. Open this site over https:// (or use localhost on this machine).");
+      toast.error("Location needs HTTPS — a plain http:// address on another device won't work.");
+      return;
+    }
+    setGeoError(null);
+    setGeoDenied(false);
+    setSharing(true);
+  };
 
   // One honest sentence about why numbers may be missing — or null when the
   // feed is genuinely delivering readings.
@@ -377,10 +627,149 @@ export default function CrowdMonitoring() {
                 edges={venue?.edges || []}
                 cells={live?.cells || []}
                 dots={live?.dots || []}
+                clusters={clusters}
+                clusterEvents={clusterEvents}
+                dangerZones={live?.dangerZones || []}
+                gateLoads={live?.gateLoads || []}
+                markers={markers}
+                youAreAt={coords ? [coords.lat, coords.lng] : null}
+                alertedAreas={alertedAreas}
+                legend
               />
             </div>
           </div>
 
+          <div className="space-y-6">
+          {/* Alerts + announcements — the central agent's risk escalations and the
+              authority's announcements, right where a person watching the map is
+              already looking. Each list scrolls inside a capped box so a long run
+              of alerts can never stretch the page. */}
+          <div className="rounded-[2rem] border border-white/10 bg-white/[0.05] p-6 backdrop-blur-xl">
+            <div className="mb-4 flex items-center justify-between gap-2">
+              <div>
+                <p className="text-xs uppercase tracking-[0.32em] text-cyan-300/70">Safety feed</p>
+                <h2 className="mt-2 text-xl font-bold">Alerts &amp; announcements</h2>
+              </div>
+              <Bell className="h-5 w-5 text-amber-300" />
+            </div>
+
+            <button
+              type="button"
+              onClick={sharing ? () => setSharing(false) : enableSharing}
+              className={`flex w-full items-center justify-center gap-2 rounded-2xl border px-4 py-3 text-sm font-semibold transition ${
+                sharing
+                  ? "border-emerald-400/30 bg-emerald-500/10 text-emerald-200 hover:bg-emerald-500/15"
+                  : geoDenied || geoError
+                    ? "border-red-400/30 bg-red-500/10 text-red-200 hover:bg-red-500/15"
+                    : "border-cyan-400/25 bg-cyan-400/10 text-cyan-200 hover:bg-cyan-400/15"
+              }`}
+            >
+              <LocateFixed size={16} />
+              {sharing
+                ? "Sharing your location · live"
+                : geoDenied
+                  ? "Location blocked — enable it in your browser"
+                  : geoError
+                    ? "Couldn't share location — tap to retry"
+                    : "Share my location to be counted"}
+            </button>
+            {/* Only complain when we genuinely have nothing. A stale "still trying
+                to get a fix" sitting above a perfectly good coordinate (the watch
+                timing out while the polls succeed) just makes the page look broken. */}
+            {geoError && !coords && (
+              <p className="mt-2 flex items-start gap-1.5 text-[11px] leading-5 text-amber-300">
+                <AlertTriangle size={12} className="mt-0.5 shrink-0" />
+                {geoError}
+              </p>
+            )}
+
+            {/* Sharing diagnostics: which stage is working. GPS fix? Heartbeat
+                accepted? Counted by the server? Each stage says so plainly, so a
+                failure is never a silent one. */}
+            {sharing && (
+              <div className="mt-2 space-y-1 rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-[11px] leading-5">
+                <p className={coords ? "text-emerald-300" : "text-amber-300"}>
+                  {coords
+                    ? `GPS fix: ${coords.lat.toFixed(5)}, ${coords.lng.toFixed(5)}${accuracyM != null ? ` (±${accuracyM} m)` : ""}`
+                    : "Waiting for a GPS fix from your browser…"}
+                </p>
+                {sendError ? (
+                  <p className="text-red-300">{sendError}</p>
+                ) : (
+                  <p className={lastSentAt ? "text-emerald-300" : "text-slate-500"}>
+                    {lastSentAt
+                      ? `Location sent ${timeAgo(lastSentAt)} · you are being counted`
+                      : "Not sent yet — sending starts as soon as there's a fix."}
+                  </p>
+                )}
+              </div>
+            )}
+            <p className="mt-2 text-[11px] leading-5 text-slate-500">
+              Anonymised location only — the system sees density, never your identity. It also lets alerts
+              reach you if crowding builds where you are standing.
+            </p>
+
+            <div className="mt-5">
+              <p className="mb-2 flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wider text-slate-400">
+                <Megaphone size={13} className="text-cyan-300" />
+                Announcements
+              </p>
+              {announcements.length === 0 ? (
+                <p className="rounded-xl border border-white/10 bg-black/20 px-3 py-2.5 text-xs text-slate-500">
+                  No announcements yet — messages from event control will appear here.
+                </p>
+              ) : (
+                <div className="max-h-60 space-y-2 overflow-y-auto pr-1">
+                  {announcements.map((b) => {
+                    const tone = BROADCAST_TONE[b.severity] || BROADCAST_TONE.info;
+                    const scoped = Array.isArray(b.zoneIds) && b.zoneIds.length > 0;
+                    return (
+                      <div
+                        key={b.id || b.createdAt}
+                        className={`rounded-xl border px-3 py-2.5 ${tone} ${
+                          b.forMe ? "ring-2 ring-red-400/70" : ""
+                        }`}
+                      >
+                        <div className="flex items-center gap-2 text-[10px] font-semibold uppercase tracking-wider opacity-80">
+                          {b.source === "agent" ? <Bot size={11} /> : <ShieldCheck size={11} />}
+                          {b.source === "agent" ? "AI advisory" : "Event control"}
+                          {b.forMe && (
+                            <span className="inline-flex items-center gap-0.5 rounded-full bg-red-500/30 px-1.5 py-0.5 text-red-50">
+                              for your area
+                            </span>
+                          )}
+                          {scoped && !b.forMe && (
+                            <span className="inline-flex items-center gap-0.5 rounded-full border border-white/25 px-1.5 py-0.5">
+                              <MapPin size={9} /> area
+                            </span>
+                          )}
+                          <span className="ml-auto opacity-70">{timeAgo(b.createdAt)}</span>
+                        </div>
+                        <p className="mt-1 text-sm leading-5">{b.message}</p>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+
+            <div className="mt-5">
+              <p className="mb-2 flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wider text-slate-400">
+                <AlertTriangle size={13} className="text-amber-300" />
+                Live risk alerts
+                {alerts.length > 0 && (
+                  <span className="rounded-full bg-red-500/20 px-2 py-0.5 text-[10px] font-bold text-red-200">
+                    {alerts.length}
+                  </span>
+                )}
+              </p>
+              <div className="max-h-60 overflow-y-auto pr-1">
+                <AlertsFeed alerts={alerts} />
+              </div>
+            </div>
+          </div>
+
+          {/* Zone status */}
           <div className="rounded-[2rem] border border-white/10 bg-white/[0.05] p-6 backdrop-blur-xl">
             <div className="mb-5 flex items-center justify-between">
               <div>
@@ -450,6 +839,22 @@ export default function CrowdMonitoring() {
               </motion.div>
             )}
           </div>
+          </div>
+        </div>
+
+        {/* Personal routing agent — the citizen's own agent draws a safe route
+            and reroutes live as the crowd shifts. Distinct from the central
+            agent above, which manages the whole crowd. */}
+        <div className="mt-8">
+          <PersonalRoutePanel
+            eventId={id}
+            venue={venue}
+            center={center}
+            coords={coords}
+            liveZones={live?.zones || []}
+            sharing={sharing}
+            onEnableLocation={enableSharing}
+          />
         </div>
 
         <motion.div

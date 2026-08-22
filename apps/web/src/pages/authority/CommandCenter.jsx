@@ -18,6 +18,8 @@ import {
   Send,
   X,
   Loader2,
+  Play,
+  Square,
 } from "lucide-react";
 import {
   LineChart,
@@ -33,10 +35,11 @@ import toast from "react-hot-toast";
 import api from "../../utils/axios";
 import { useCrowdFeed } from "../../hooks/useCrowdFeed";
 import AlertsFeed from "../../components/AlertsFeed";
+import IncidentTriage from "../../components/IncidentTriage";
 import AgentProposals from "../../components/AgentProposals";
 import TrackedCrowds from "../../components/TrackedCrowds";
 import LiveCrowdMap from "../../components/map/LiveCrowdMap";
-import { severityMeta, formatEta, timeAgo } from "../../utils/riskUi";
+import { severityMeta, riskMeta, formatEta, timeAgo } from "../../utils/riskUi";
 import { deriveAgentOverlay } from "../../utils/agentOverlay";
 
 const cardStyle = "rounded-3xl border border-white/10 bg-white/[0.05] backdrop-blur-xl";
@@ -79,13 +82,37 @@ export default function CommandCenter() {
   const [bcHindi, setBcHindi] = useState("");
   const [bcOdia, setBcOdia] = useState("");
   const [bcSeverity, setBcSeverity] = useState("info");
+  // Zone targeting: empty = public (everyone). Any selected zone ids scope the
+  // announcement to people standing inside those polygons.
+  const [bcZoneIds, setBcZoneIds] = useState([]);
   const [sending, setSending] = useState(false);
   // Announcements fetched on mount; the socket feed supplies everything after.
   const [seedBroadcasts, setSeedBroadcasts] = useState([]);
+  // Annotation markers the authority dropped in the map editor — medical posts,
+  // help desks, water points. They were never loaded here, so the command map
+  // showed none of them; now they ride onto the same LiveCrowdMap.
+  const [markers, setMarkers] = useState([]);
+  // Alerts this operator has marked as seen, so the feed reflects it instantly
+  // rather than waiting for the next snapshot seed to carry the status back.
+  const [ackedAlertIds, setAckedAlertIds] = useState(() => new Set());
+  // Geolocated SOS/incident reports, handed up by the triage panel for the map.
+  const [incidentPins, setIncidentPins] = useState([]);
+
+  // Crowd simulator (test harness). This is the honest way to exercise the
+  // triggering + prediction logic: it drives the SAME GPS→H3→density→risk
+  // pipeline a real crowd would, via the authority /sim endpoints, rather than
+  // painting fake numbers onto the dashboard. It ramps a synthetic crowd up to a
+  // peak over a chosen window, so thresholds (Watch→Elevated→High→Critical) fire
+  // in order and you can watch when — and how early the forecaster calls it.
+  const [simStatus, setSimStatus] = useState(null);
+  const [simBusy, setSimBusy] = useState(false);
+  const [simPeak, setSimPeak] = useState(8000);
+  const [simRampMin, setSimRampMin] = useState(5);
 
   // Live Tier 1 alerts + what the AI did (also keeps the broadcaster running
   // while the room is open).
-  const { frame, clusters, clusterEvents, alerts, agentActions, broadcasts } = useCrowdFeed(id);
+  const { frame, clusters, clusterEvents, alerts, agentActions, broadcasts, agentStatus, alertedAreas } =
+    useCrowdFeed(id);
   const seenAlerts = useRef(new Set());
   useEffect(() => {
     for (const a of alerts) {
@@ -155,6 +182,43 @@ export default function CommandCenter() {
     };
   }, [id]);
 
+  // The authority's dropped annotation markers, so the command map matches the
+  // map editor. Read-only here (editing lives in the editor).
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      try {
+        const res = await api.get(`/events/${id}/markers`);
+        if (alive) setMarkers(res.data?.markers || []);
+      } catch {
+        // non-fatal: markers are context, not safety-critical here
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+  }, [id]);
+
+  // Poll the simulator's own state so the control reflects the live ramp (and
+  // stays correct if another operator started it, or after a page reload).
+  useEffect(() => {
+    let alive = true;
+    const poll = async () => {
+      try {
+        const res = await api.get(`/events/${id}/sim/status`);
+        if (alive) setSimStatus(res.data?.status || null);
+      } catch {
+        // non-fatal: the control just shows its last known state
+      }
+    };
+    poll();
+    const t = setInterval(poll, 4000);
+    return () => {
+      alive = false;
+      clearInterval(t);
+    };
+  }, [id]);
+
   // Escape closes the composer.
   useEffect(() => {
     if (!composerOpen) return undefined;
@@ -170,7 +234,17 @@ export default function CommandCenter() {
     : DEFAULT_CENTER;
 
   // Same AI overlay the authority live map draws.
-  const { highlightZones, agentRoutes } = useMemo(() => deriveAgentOverlay(agentActions, venue), [agentActions, venue]);
+  const { highlightZones, agentRoutes, flaggedAreas, barricades, placements } = useMemo(
+    () => deriveAgentOverlay(agentActions, venue),
+    [agentActions, venue]
+  );
+
+  // Ground the agent warned, with a relative time so the flag on the map reads
+  // like an event ("4m ago") rather than a bare timestamp.
+  const alertedOnMap = useMemo(
+    () => (alertedAreas || []).map((a) => ({ ...a, ago: a.at ? timeAgo(a.at) : "" })),
+    [alertedAreas]
+  );
 
   // Live pushes first, then the seeded history — de-duped by id, newest first.
   const announcements = useMemo(() => {
@@ -185,11 +259,58 @@ export default function CommandCenter() {
       .slice(0, 6);
   }, [broadcasts, seedBroadcasts]);
 
+  /* Targetable areas: the authored zone polygons, decorated with what the live
+     pipeline currently says about each one. Sorted worst-first so the zone that
+     needs warning is the easiest one to pick. */
+  const zoneTargets = useMemo(() => {
+    const live = new Map((frame?.zones || []).map((z) => [z.id, z]));
+    return (venue?.zones || [])
+      .filter((z) => z.polygon?.length >= 3)
+      .map((z) => {
+        const l = live.get(z.id);
+        return {
+          id: z.id,
+          name: z.name || z.id,
+          type: z.type,
+          riskLevel: l?.riskLevel || null,
+          personsEst: l?.personsEst ?? null,
+          etaCriticalSec: l?.forecast?.etaCriticalSec ?? null,
+          rank: l?.risk ?? -1,
+        };
+      })
+      .sort((a, b) => b.rank - a.rank);
+  }, [venue, frame]);
+
+  /**
+   * Record that the control room has seen an alert.
+   *
+   * The endpoint existed from the start; nothing ever called it, so every alert
+   * looked equally unattended and an operator working a long incident had no way
+   * to mark what they had already dealt with.
+   */
+  const acknowledgeAlert = useCallback(
+    async (alertId) => {
+      try {
+        await api.patch(`/events/${id}/alerts/${alertId}/ack`);
+        setAckedAlertIds((prev) => new Set(prev).add(alertId));
+      } catch (err) {
+        toast.error(err.response?.data?.message || "Couldn't acknowledge that alert");
+        throw err;
+      }
+    },
+    [id]
+  );
+
+  const toggleZoneTarget = useCallback((zoneId) => {
+    setBcZoneIds((prev) => (prev.includes(zoneId) ? prev.filter((z) => z !== zoneId) : [...prev, zoneId]));
+  }, []);
+
   const resetComposer = useCallback(() => {
     setBcMessage("");
     setBcHindi("");
     setBcOdia("");
     setBcSeverity("info");
+    setBcZoneIds([]);
   }, []);
 
   const sendAnnouncement = useCallback(async () => {
@@ -209,11 +330,18 @@ export default function CommandCenter() {
         message,
         messages: Object.keys(messages).length > 1 ? messages : undefined,
         severity: bcSeverity,
+        // Omitted entirely when nothing is selected, so the backend stores no
+        // targeting and every citizen treats it as public.
+        zoneIds: bcZoneIds.length ? bcZoneIds : undefined,
       });
       const created = res.data?.broadcast;
       // The socket echo usually beats this; the id de-dupe keeps it to one row.
       if (created) setSeedBroadcasts((prev) => [created, ...prev]);
-      toast.success("Announcement sent to the crowd");
+      toast.success(
+        bcZoneIds.length
+          ? `Alert sent to ${bcZoneIds.length} targeted area${bcZoneIds.length === 1 ? "" : "s"}`
+          : "Announcement sent to the crowd"
+      );
       resetComposer();
       setComposerOpen(false);
     } catch (err) {
@@ -221,7 +349,45 @@ export default function CommandCenter() {
     } finally {
       setSending(false);
     }
-  }, [id, bcMessage, bcHindi, bcOdia, bcSeverity, resetComposer]);
+  }, [id, bcMessage, bcHindi, bcOdia, bcSeverity, bcZoneIds, resetComposer]);
+
+  const simRunning = !!simStatus?.running;
+
+  const startSimulation = useCallback(async () => {
+    setSimBusy(true);
+    try {
+      const res = await api.post(`/events/${id}/sim/start`, {
+        // Clamp to the backend's own accepted range so a stray keystroke can't
+        // ask for a million agents.
+        count: Math.max(100, Math.min(50000, Math.round(Number(simPeak) || 0))),
+        rampSeconds: Math.max(0, Math.round((Number(simRampMin) || 0) * 60)),
+      });
+      setSimStatus(res.data?.status || null);
+      const st = res.data?.status;
+      toast.success(
+        st && st.routable === false
+          ? "Simulation started — scattering a synthetic crowd (no venue graph drawn)"
+          : "Simulation started — ramping a synthetic crowd through the venue"
+      );
+    } catch (err) {
+      toast.error(err.response?.data?.message || "Couldn't start the simulation");
+    } finally {
+      setSimBusy(false);
+    }
+  }, [id, simPeak, simRampMin]);
+
+  const stopSimulation = useCallback(async () => {
+    setSimBusy(true);
+    try {
+      const res = await api.post(`/events/${id}/sim/stop`);
+      setSimStatus(res.data?.status || { running: false });
+      toast("Simulation stopped — synthetic crowd cleared");
+    } catch (err) {
+      toast.error(err.response?.data?.message || "Couldn't stop the simulation");
+    } finally {
+      setSimBusy(false);
+    }
+  }, [id]);
 
   if (loading) {
     return (
@@ -265,6 +431,17 @@ export default function CommandCenter() {
   }
 
   const live = snapshot.hasLiveData;
+  /**
+   * Is risk actually being scored right now?
+   *
+   * This used to ask "has the operator drawn a zone", because risk only existed
+   * per hand-drawn zone. The coverage area is now itself a zone, so the honest
+   * question is whether the predictor is returning any zone at all — which it is
+   * as soon as a boundary exists. Only a venue with no coverage drawn has nothing
+   * to score.
+   */
+  const riskTracked = (frame?.zones?.length ?? 0) > 0 || (venue?.zones?.length ?? 0) > 0;
+  const coverageDrawn = (venue?.aor?.polygon?.length ?? 0) >= 3;
   const stats = [
     {
       id: 1,
@@ -283,9 +460,20 @@ export default function CommandCenter() {
     {
       id: 2,
       title: "Risk Probability",
-      value: live ? `${snapshot.riskProbability}%` : "—",
+      /**
+       * Risk is scored PER ZONE. With none drawn there is nothing to score, and
+       * printing "0%" next to a green "Low" badge told the operator the venue was
+       * safe when the truth was that nothing was being measured at all — with
+       * 51,580 people on the map. Unmeasured must look unmeasured (§17).
+       */
+      value: !riskTracked ? "—" : live ? `${snapshot.riskProbability}%` : "—",
       icon: AlertTriangle,
-      status: live ? snapshot.riskLevel : "No readings",
+      status: !riskTracked ? "No coverage drawn" : live ? snapshot.riskLevel : "No readings",
+      note: !riskTracked
+        ? "Draw the coverage area to start scoring risk"
+        : snapshot.worstZone?.name
+          ? `Worst area: ${snapshot.worstZone.name}`
+          : undefined,
     },
     {
       id: 3,
@@ -309,7 +497,7 @@ export default function CommandCenter() {
       <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_top_left,_rgba(34,211,238,0.18),_transparent_30%),radial-gradient(circle_at_bottom_right,_rgba(59,130,246,0.14),_transparent_28%)]" />
       <div className="pointer-events-none absolute inset-0 bg-[linear-gradient(to_right,rgba(255,255,255,0.03)_1px,transparent_1px),linear-gradient(to_bottom,rgba(255,255,255,0.03)_1px,transparent_1px)] bg-[size:72px_72px] opacity-20" />
 
-      <div className="relative mx-auto max-w-7xl px-5 py-8 sm:px-8 lg:px-10">
+      <div className="relative mx-auto max-w-[1600px] px-5 py-8 sm:px-8 lg:px-10">
         <div className="mb-6 flex flex-wrap items-center justify-between gap-3">
           <button
             onClick={() => navigate("/authority/events")}
@@ -319,6 +507,80 @@ export default function CommandCenter() {
             Back to your events
           </button>
 
+          {/* Crowd simulator — a test harness, styled amber + dashed so it never
+              reads as a live operational control. It feeds the real pipeline. */}
+          <div className="flex flex-wrap items-center gap-2 rounded-2xl border border-dashed border-amber-400/30 bg-amber-500/[0.06] px-3 py-2">
+            <span className="flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wider text-amber-200/90">
+              <Users size={13} />
+              Crowd simulator
+              <span className="rounded-full bg-amber-400/15 px-1.5 py-0.5 text-[9px] tracking-wide text-amber-200">
+                TEST
+              </span>
+            </span>
+
+            {!simRunning ? (
+              <>
+                <label className="flex items-center gap-1 text-[11px] text-slate-400">
+                  Peak
+                  <input
+                    type="number"
+                    value={simPeak}
+                    min={100}
+                    max={50000}
+                    step={500}
+                    onChange={(e) => setSimPeak(e.target.value)}
+                    className="w-20 rounded-lg border border-white/10 bg-white/[0.05] px-2 py-1 text-xs text-white outline-none focus:border-amber-400/50"
+                  />
+                </label>
+                <label className="flex items-center gap-1 text-[11px] text-slate-400">
+                  Ramp
+                  <input
+                    type="number"
+                    value={simRampMin}
+                    min={0}
+                    max={60}
+                    step={1}
+                    onChange={(e) => setSimRampMin(e.target.value)}
+                    className="w-14 rounded-lg border border-white/10 bg-white/[0.05] px-2 py-1 text-xs text-white outline-none focus:border-amber-400/50"
+                  />
+                  <span className="text-slate-500">min</span>
+                </label>
+                <button
+                  type="button"
+                  onClick={startSimulation}
+                  disabled={simBusy}
+                  className="inline-flex items-center gap-1.5 rounded-xl border border-emerald-400/30 bg-emerald-500/15 px-3 py-1.5 text-xs font-semibold text-emerald-200 transition hover:bg-emerald-500/25 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {simBusy ? <Loader2 size={13} className="animate-spin" /> : <Play size={13} />}
+                  Start
+                </button>
+              </>
+            ) : (
+              <>
+                <span className="inline-flex items-center gap-1.5 text-xs text-amber-100">
+                  <motion.span
+                    animate={{ opacity: [1, 0.3, 1] }}
+                    transition={{ duration: 1.4, repeat: Infinity }}
+                    className="h-1.5 w-1.5 rounded-full bg-amber-300"
+                  />
+                  {(simStatus.active ?? 0).toLocaleString("en-IN")} / {(simStatus.target ?? 0).toLocaleString("en-IN")}
+                  <span className="text-amber-200/70">
+                    {(simStatus.active ?? 0) < (simStatus.target ?? 0) ? "ramping" : "holding"}
+                    {simStatus.routable === false ? " · scattered" : ""}
+                  </span>
+                </span>
+                <button
+                  type="button"
+                  onClick={stopSimulation}
+                  disabled={simBusy}
+                  className="inline-flex items-center gap-1.5 rounded-xl border border-red-400/30 bg-red-500/15 px-3 py-1.5 text-xs font-semibold text-red-200 transition hover:bg-red-500/25 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {simBusy ? <Loader2 size={13} className="animate-spin" /> : <Square size={13} />}
+                  Stop
+                </button>
+              </>
+            )}
+          </div>
         </div>
 
         <div className="mb-8 flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
@@ -366,6 +628,36 @@ export default function CommandCenter() {
             ))}
           </div>
         </div>
+
+        {/* The old "risk detection is off" warning is gone: the coverage area is
+            now scored as a zone in its own right, so risk, escalation and
+            time-to-critical work as soon as a boundary exists. The only case with
+            genuinely nothing to measure is a venue with no coverage drawn at all. */}
+        {!coverageDrawn && (
+          <div className="mb-6 flex flex-col gap-3 rounded-2xl border border-amber-400/30 bg-amber-500/[0.08] p-4 sm:flex-row sm:items-center sm:justify-between">
+            <div className="flex items-start gap-3">
+              <div className="mt-0.5 flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-xl border border-amber-400/25 bg-amber-500/15">
+                <AlertTriangle size={17} className="text-amber-300" />
+              </div>
+              <div>
+                <p className="text-sm font-semibold text-amber-100">No coverage area drawn yet</p>
+                <p className="mt-1 max-w-2xl text-xs leading-5 text-amber-200/80">
+                  Draw the boundary you are responsible for in the Map Editor. Everything else follows from it: the crowd is
+                  counted inside it, risk is scored across it, and the agent starts watching. Adding zones around individual
+                  chokepoints later makes the warnings more precise, but is not required to begin.
+                </p>
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={() => navigate(`/authority/events/${id}/map`)}
+              className="inline-flex flex-shrink-0 items-center justify-center gap-1.5 rounded-xl border border-amber-400/40 bg-amber-500/15 px-4 py-2 text-xs font-semibold text-amber-100 transition hover:bg-amber-500/25"
+            >
+              <MapPin size={14} />
+              Open Map Editor
+            </button>
+          </div>
+        )}
 
         <div className="grid gap-5 sm:grid-cols-2 xl:grid-cols-4">
           {stats.map((item, index) => {
@@ -419,9 +711,69 @@ export default function CommandCenter() {
           })}
         </div>
 
-        <div className="mt-8 grid gap-6 lg:grid-cols-[1.65fr_0.85fr]">
-          {/* No hover-scale here: a CSS transform on a Leaflet ancestor shifts
-              its hit-testing, and this card now holds the real map. */}
+        {/* THE GUARDIAN'S PULSE.
+            An autonomous safety agent that works silently is indistinguishable
+            from one that has crashed. This strip is the operator's evidence that
+            it is watching: what it is doing right now, when it last reasoned,
+            how many danger pockets it can see, and how much ground it has warned
+            on its own authority. */}
+        <div className="mt-8 flex flex-wrap items-center gap-x-5 gap-y-3 rounded-2xl border border-cyan-400/20 bg-cyan-500/[0.06] px-5 py-3.5">
+          <span className="inline-flex items-center gap-2 text-sm font-semibold text-cyan-100">
+            <Bot size={16} className="text-cyan-300" />
+            Guardian agent
+          </span>
+
+          {agentStatus?.phase === "thinking" ? (
+            <span className="inline-flex items-center gap-2 rounded-full border border-amber-400/30 bg-amber-500/10 px-3 py-1 text-xs font-medium text-amber-200">
+              <Loader2 size={12} className="animate-spin" />
+              Assessing the situation…
+            </span>
+          ) : (
+            <span className="inline-flex items-center gap-2 rounded-full border border-emerald-400/25 bg-emerald-500/10 px-3 py-1 text-xs font-medium text-emerald-200">
+              <span className="relative flex h-2 w-2">
+                <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400/70" />
+                <span className="relative inline-flex h-2 w-2 rounded-full bg-emerald-400" />
+              </span>
+              Watching continuously
+            </span>
+          )}
+
+          <span className="text-xs text-slate-300">
+            Last assessment:{" "}
+            <span className="font-medium text-white">
+              {agentStatus?.lastRunAt ? timeAgo(agentStatus.lastRunAt) : "waiting for the first pass"}
+            </span>
+            {agentStatus?.severity ? (
+              <span className="ml-1 text-slate-400">· judged {agentStatus.severity}</span>
+            ) : null}
+            {agentStatus?.trigger ? <span className="ml-1 text-slate-500">· {agentStatus.trigger}</span> : null}
+          </span>
+
+          <span className="text-xs text-slate-300">
+            Danger areas it can see:{" "}
+            <span className="font-medium text-white">{agentStatus?.dangerAreas ?? frame?.dangerZones?.length ?? 0}</span>
+          </span>
+
+          {alertedOnMap.length > 0 && (
+            <span className="inline-flex items-center gap-1.5 rounded-full border border-pink-400/25 bg-pink-500/10 px-3 py-1 text-xs font-medium text-pink-200">
+              📣 {alertedOnMap.length} area{alertedOnMap.length === 1 ? "" : "s"} warned — flagged on the map
+            </span>
+          )}
+          {placements.length > 0 && (
+            <span className="inline-flex items-center gap-1.5 rounded-full border border-amber-400/25 bg-amber-500/10 px-3 py-1 text-xs font-medium text-amber-200">
+              📌 {placements.length} placement{placements.length === 1 ? "" : "s"} awaiting you
+            </span>
+          )}
+        </div>
+
+        <div className="mt-6 space-y-6">
+          {/* Map + the agent's live alerts, side by side and matched in height. */}
+          <div className="grid gap-6 xl:grid-cols-[1.8fr_1fr] xl:items-stretch">
+          {/* The map is the screen: full width and tall, so the danger zones,
+              routes, groups and gates are readable instead of stacked in a
+              cramped panel. The command rail sits below it, spread across the
+              width. No hover-scale here: a CSS transform on a Leaflet ancestor
+              shifts its hit-testing, and this card holds the real map. */}
           <div className={`${cardStyle} relative overflow-hidden p-5 sm:p-6`}>
             <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_center,rgba(34,211,238,0.08),transparent_40%)]" />
             <div className="relative mb-5 flex flex-wrap items-center justify-between gap-3">
@@ -429,37 +781,53 @@ export default function CommandCenter() {
                 <p className="text-xs uppercase tracking-[0.32em] text-cyan-300/70">Live Crowd Heat Map</p>
                 <h2 className="mt-2 text-xl font-bold sm:text-2xl">Density visualization</h2>
               </div>
-              <div
-                className={`inline-flex items-center gap-2 rounded-full border px-4 py-2 text-sm ${
-                  snapshot.riskLevel === "High"
-                    ? "border-red-400/20 bg-red-500/10 text-red-200"
-                    : "border-emerald-400/20 bg-emerald-500/10 text-emerald-200"
-                }`}
-              >
-                <span
-                  className={`h-2 w-2 rounded-full ${
-                    snapshot.riskLevel === "High" ? "bg-red-300 shadow-[0_0_10px_rgba(248,113,113,0.9)]" : "bg-emerald-300"
-                  }`}
-                />
-                {snapshot.riskLevel === "High" ? "High density area" : "Density within limits"}
-              </div>
+              {/* Never a green "within limits" for ground nobody is scoring: with
+                  no zones drawn, or no live danger pockets measured, say so. */}
+              {(() => {
+                const dangerCount = frame?.dangerZones?.length ?? 0;
+                const badge = !riskTracked && dangerCount === 0
+                  ? { cls: "border-white/15 bg-white/10 text-slate-300", dot: "bg-slate-400", text: "No coverage drawn" }
+                  : dangerCount > 0
+                    ? {
+                        cls: "border-red-400/20 bg-red-500/10 text-red-200",
+                        dot: "bg-red-300 shadow-[0_0_10px_rgba(248,113,113,0.9)]",
+                        text: `${dangerCount} live danger area${dangerCount === 1 ? "" : "s"}`,
+                      }
+                    : snapshot.riskLevel === "High"
+                      ? { cls: "border-red-400/20 bg-red-500/10 text-red-200", dot: "bg-red-300", text: "High density area" }
+                      : { cls: "border-emerald-400/20 bg-emerald-500/10 text-emerald-200", dot: "bg-emerald-300", text: "Density within limits" };
+                return (
+                  <div className={`inline-flex items-center gap-2 rounded-full border px-4 py-2 text-sm ${badge.cls}`}>
+                    <span className={`h-2 w-2 rounded-full ${badge.dot}`} />
+                    {badge.text}
+                  </div>
+                );
+              })()}
             </div>
 
-            <div className="relative h-[420px] overflow-hidden rounded-[2rem] border border-white/10 bg-[linear-gradient(180deg,rgba(15,23,42,0.9),rgba(2,6,23,0.95))]">
+            <div className="relative h-[72vh] min-h-[520px] overflow-hidden rounded-[2rem] border border-white/10 bg-[linear-gradient(180deg,rgba(15,23,42,0.9),rgba(2,6,23,0.95))]">
               <LiveCrowdMap
                 center={center}
                 venue={{ name: event?.location?.venueName, address: event?.location?.address }}
                 aor={venue?.aor?.polygon || []}
                 zones={venue?.zones || []}
                 liveZones={frame?.zones || []}
+                dangerZones={frame?.dangerZones || []}
+                gateLoads={frame?.gateLoads || []}
                 nodes={venue?.nodes || []}
                 edges={venue?.edges || []}
                 cells={frame?.cells || []}
                 dots={frame?.dots || []}
                 clusters={clusters}
                 clusterEvents={clusterEvents}
+                markers={markers}
                 highlightZones={highlightZones}
                 agentRoutes={agentRoutes}
+                flaggedAreas={flaggedAreas}
+                barricades={barricades}
+                alertedAreas={alertedOnMap}
+                placements={placements}
+                incidents={incidentPins}
                 legend
               />
 
@@ -477,11 +845,24 @@ export default function CommandCenter() {
                     {clusters.filter((k) => k.crowd).length === 1 ? "" : "s"} merged into bubbles
                   </span>
                 )}
-                {(highlightZones.length > 0 || agentRoutes.length > 0) && (
+                {(highlightZones.length > 0 ||
+                  agentRoutes.length > 0 ||
+                  flaggedAreas.length > 0 ||
+                  barricades.length > 0) && (
                   <span className="inline-flex items-center gap-1.5 rounded-2xl border border-pink-400/25 bg-slate-950/85 px-3 py-1.5 text-xs text-pink-200 backdrop-blur-xl">
                     <Bot size={13} />
-                    {highlightZones.length} zone{highlightZones.length === 1 ? "" : "s"} · {agentRoutes.length} route
-                    {agentRoutes.length === 1 ? "" : "s"} flagged by AI
+                    {[
+                      (highlightZones.length + flaggedAreas.length) > 0 &&
+                        `${highlightZones.length + flaggedAreas.length} area${
+                          highlightZones.length + flaggedAreas.length === 1 ? "" : "s"
+                        }`,
+                      agentRoutes.length > 0 && `${agentRoutes.length} route${agentRoutes.length === 1 ? "" : "s"}`,
+                      barricades.length > 0 &&
+                        `${barricades.length} barricade${barricades.length === 1 ? "" : "s"}`,
+                    ]
+                      .filter(Boolean)
+                      .join(" · ")}{" "}
+                    flagged by AI
                   </span>
                 )}
               </div>
@@ -515,7 +896,16 @@ export default function CommandCenter() {
             </div>
           </div>
 
-          <div className="space-y-6">
+            {/* Alerts from agent — beside the map, its own scroll, matched to the
+                map's height. Bounded on EVERY breakpoint (the old xl:h-auto let
+                it grow with the feed and stretch the whole page); the list now
+                scrolls inside this fixed box. */}
+            <div className="h-[72vh] min-h-[520px]">
+              <AgentProposals eventId={id} />
+            </div>
+          </div>
+
+          <div className="grid items-start gap-6 md:grid-cols-2 xl:grid-cols-3">
           {/* Tracked crowds sit above the alert feed deliberately: two bodies of
               people closing on each other is visible here before any zone has
               escalated, which is the whole point of tracking them as objects. */}
@@ -530,11 +920,13 @@ export default function CommandCenter() {
               </div>
               <Bell className="h-5 w-5 text-amber-300" />
             </div>
-            <AlertsFeed alerts={alerts} />
+            <AlertsFeed alerts={alerts} onAcknowledge={acknowledgeAlert} acknowledgedIds={ackedAlertIds} />
           </div>
 
-          {/* Autonomous AI agent — event-scoped proposals + approvals */}
-          <AgentProposals eventId={id} />
+          {/* People calling for help. Citizens could always raise an SOS; until now
+              nothing in the console listened, so a panic press went into a queue no
+              human could see. */}
+          <IncidentTriage eventId={id} onIncidents={setIncidentPins} />
 
           {/* Response + announcements. There is deliberately no separate
               "AI recommendations" list here: recommendations come from the agent
@@ -752,6 +1144,81 @@ export default function CommandCenter() {
                   </select>
                 </div>
 
+                {/* Who receives it. Nothing selected = everyone. Selecting areas
+                    scopes delivery to the people standing inside those polygons,
+                    which is what makes a "move out of the north corridor before
+                    the crowd arrives" warning land only where it applies. */}
+                <div>
+                  <div className="mb-1.5 flex items-center justify-between gap-2">
+                    <label className="text-xs font-medium uppercase tracking-[0.18em] text-slate-400">
+                      Target areas
+                    </label>
+                    {bcZoneIds.length > 0 && (
+                      <button
+                        type="button"
+                        onClick={() => setBcZoneIds([])}
+                        className="text-[11px] font-medium text-cyan-300 transition hover:text-cyan-200"
+                      >
+                        Clear ({bcZoneIds.length})
+                      </button>
+                    )}
+                  </div>
+
+                  {zoneTargets.length === 0 ? (
+                    <p className="rounded-xl border border-dashed border-white/10 bg-white/[0.02] px-3 py-2.5 text-[11px] leading-5 text-slate-500">
+                      No zones drawn for this event yet — the announcement will reach everyone. Draw
+                      zones in the Venue Graph Editor to enable area-targeted alerts.
+                    </p>
+                  ) : (
+                    <>
+                      <div className="flex flex-wrap gap-2">
+                        {zoneTargets.map((z) => {
+                          const active = bcZoneIds.includes(z.id);
+                          const meta = z.riskLevel ? riskMeta(z.riskLevel) : null;
+                          const eta = formatEta(z.etaCriticalSec);
+                          return (
+                            <button
+                              key={z.id}
+                              type="button"
+                              onClick={() => toggleZoneTarget(z.id)}
+                              aria-pressed={active}
+                              title={
+                                meta
+                                  ? `${meta.label}${z.personsEst != null ? ` · ~${z.personsEst} people` : ""}${eta ? ` · critical in ~${eta}` : ""}`
+                                  : "No live data for this zone yet"
+                              }
+                              className={`inline-flex items-center gap-1.5 rounded-full border px-3 py-1.5 text-xs font-medium transition ${
+                                active
+                                  ? "border-cyan-400/50 bg-gradient-to-r from-cyan-400 to-blue-500 text-slate-950"
+                                  : "border-white/10 bg-white/[0.04] text-slate-300 hover:border-cyan-400/25 hover:text-white"
+                              }`}
+                            >
+                              {meta && (
+                                <span
+                                  className="h-1.5 w-1.5 shrink-0 rounded-full"
+                                  style={{ backgroundColor: meta.color }}
+                                  aria-hidden="true"
+                                />
+                              )}
+                              {z.name}
+                              {z.personsEst != null && (
+                                <span className={active ? "text-slate-900/70" : "text-slate-500"}>
+                                  ~{z.personsEst}
+                                </span>
+                              )}
+                            </button>
+                          );
+                        })}
+                      </div>
+                      <p className="mt-2 text-[11px] leading-5 text-slate-500">
+                        {bcZoneIds.length === 0
+                          ? "Nothing selected — this goes to everyone at the event."
+                          : `Only people inside ${bcZoneIds.length} selected area${bcZoneIds.length === 1 ? "" : "s"} will be alerted.`}
+                      </p>
+                    </>
+                  )}
+                </div>
+
                 <div className="grid gap-4 sm:grid-cols-2">
                   <div>
                     <label htmlFor="bc-hindi" className="mb-1.5 block text-xs font-medium uppercase tracking-[0.18em] text-slate-400">
@@ -784,7 +1251,9 @@ export default function CommandCenter() {
                 </div>
 
                 <p className="text-[11px] leading-5 text-slate-500">
-                  This reaches every phone in the event room immediately and is recorded in the audit log.
+                  {bcZoneIds.length === 0
+                    ? "This reaches every phone in the event room immediately and is recorded in the audit log."
+                    : "This is delivered immediately and recorded in the audit log. People outside the selected areas still see it listed under earlier announcements, marked as another area — nothing is hidden."}
                 </p>
 
                 <div className="flex flex-col-reverse gap-2 sm:flex-row sm:items-center sm:justify-end">

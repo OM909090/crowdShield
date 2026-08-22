@@ -10,7 +10,6 @@ import {
   MapPin,
   Users,
   Image as ImageIcon,
-  Navigation,
   Sparkles,
   PartyPopper,
   Trophy,
@@ -27,6 +26,7 @@ import {
   KeyRound,
 } from "lucide-react";
 import api from "../../utils/axios";
+import LocationPicker from "../../components/map/LocationPicker";
 
 const TYPES = [
   { value: "Festival", icon: PartyPopper },
@@ -59,6 +59,7 @@ export default function CreateEvent() {
     handleSubmit,
     watch,
     reset,
+    setValue,
     formState: { errors, isSubmitting },
   } = useForm({
     defaultValues: {
@@ -96,21 +97,6 @@ export default function CreateEvent() {
       .catch(() => {});
   }, []);
 
-  const useCurrentLocation = () => {
-    if (!navigator.geolocation) {
-      toast.error("Geolocation is not supported by this browser");
-      return;
-    }
-    navigator.geolocation.getCurrentPosition(
-      (position) => {
-        setCoords({ latitude: position.coords.latitude, longitude: position.coords.longitude });
-        toast.success("Venue coordinates captured");
-      },
-      () => toast.error("Location permission denied"),
-      { enableHighAccuracy: true, timeout: 10000 }
-    );
-  };
-
   const onSubmit = async (data) => {
     try {
       const payload = {
@@ -123,7 +109,7 @@ export default function CreateEvent() {
         bannerUrl: data.bannerUrl || undefined,
         location: {
           venueName: data.venueName,
-          address: data.address,
+          address: data.address || undefined,
           coordinates: coords || undefined,
         },
       };
@@ -291,44 +277,48 @@ export default function CreateEvent() {
               </div>
 
               <div>
-                <label className="mb-1.5 block text-sm font-medium text-slate-300">Venue Name</label>
+                <label className="mb-1.5 block text-sm font-medium text-slate-300">
+                  Location <span className="font-normal text-slate-500">— search or drop a pin on the map</span>
+                </label>
+                <LocationPicker
+                  value={coords ? { lat: coords.latitude, lng: coords.longitude } : null}
+                  onChange={({ lat, lng }) => setCoords({ latitude: lat, longitude: lng })}
+                  onResolved={({ venueName, address }) => {
+                    if (venueName) setValue("venueName", venueName, { shouldValidate: true });
+                    if (address) setValue("address", address);
+                  }}
+                />
+                <p className="mt-2 text-xs text-slate-500">
+                  Draw the exact coverage area and zones later in the Map Editor.
+                </p>
+              </div>
+
+              <div>
+                <label className="mb-1.5 block text-sm font-medium text-slate-300">Venue label</label>
                 <div className="relative">
                   <MapPin className="pointer-events-none absolute left-4 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
                   <input
-                    placeholder="e.g. Grand Road"
+                    placeholder="Auto-filled from the map — edit if needed"
                     className={`pl-11 ${inputClass}`}
-                    {...register("venueName", { required: "Venue name is required" })}
+                    {...register("venueName", { required: "Pick a location on the map, or type a venue name" })}
                   />
                 </div>
                 {errors.venueName && <p className="mt-1 text-xs text-red-400">{errors.venueName.message}</p>}
               </div>
 
               <div>
-                <label className="mb-1.5 block text-sm font-medium text-slate-300">Address</label>
+                <label className="mb-1.5 block text-sm font-medium text-slate-300">
+                  Address <span className="font-normal text-slate-500">(optional)</span>
+                </label>
                 <div className="relative">
                   <MapPin className="pointer-events-none absolute left-4 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
                   <input
-                    placeholder="Full address"
+                    placeholder="Auto-filled from the map"
                     className={`pl-11 ${inputClass}`}
-                    {...register("address", { required: "Address is required" })}
+                    {...register("address")}
                   />
                 </div>
-                {errors.address && <p className="mt-1 text-xs text-red-400">{errors.address.message}</p>}
               </div>
-
-              <motion.button
-                type="button"
-                onClick={useCurrentLocation}
-                whileTap={{ scale: 0.98 }}
-                className={`flex w-full items-center justify-center gap-2 rounded-2xl border px-4 py-2.5 text-sm transition ${
-                  coords
-                    ? "border-emerald-400/30 bg-emerald-500/10 text-emerald-200"
-                    : "border-cyan-400/25 bg-cyan-400/10 text-cyan-200 hover:bg-cyan-400/15"
-                }`}
-              >
-                <Navigation size={16} />
-                {coords ? "✓ Coordinates captured" : "Use current location for venue pin"}
-              </motion.button>
 
               <div className="grid grid-cols-2 gap-3">
                 <div>

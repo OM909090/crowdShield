@@ -29,11 +29,18 @@ const ev = (eventId) => {
   const key = String(eventId);
   let s = state.get(key);
   if (!s) {
-    s = { viewers: 0, timer: null, venue: undefined, venueAt: 0 };
+    s = { viewers: 0, timer: null, venue: undefined, venueAt: 0, ticking: false, slowSince: 0, lastTickAt: 0 };
     state.set(key, s);
   }
   return s;
 };
+
+/**
+ * A tick slower than this is logged once, because it is the early warning that
+ * the loop is falling behind the crowd it is supposed to be watching.
+ */
+const SLOW_TICK_MS = 900;
+const SLOW_LOG_EVERY_MS = 10_000;
 
 export function addViewer(eventId) {
   const s = ev(eventId);
@@ -62,6 +69,23 @@ async function tick(eventId) {
   const io = getIO();
   if (!io) return;
   const s = ev(eventId);
+
+  /**
+   * Overrun guard.
+   *
+   * `tick` is async (it awaits the venue read), so setInterval will happily start
+   * the next one while this is mid-flight. Under a large crowd each pass costs
+   * real CPU — aggregate, cluster, danger zones, gate loads — and once a pass
+   * takes longer than the interval the overlapping passes pile up, starve the
+   * event loop and the whole API stops accepting connections. Measured in
+   * exactly that state: 100% of a core, HTTP timing out, 30 connections queued
+   * unaccepted. Dropping a frame is always better than wedging the server:
+   * the next tick recomputes from live positions anyway, so nothing is lost.
+   */
+  if (s.ticking) return;
+  s.ticking = true;
+  const startedAt = Date.now();
+
   try {
     await loadVenue(s, eventId);
     prune(eventId);
@@ -71,7 +95,13 @@ async function tick(eventId) {
     // The map draws only what the metrics count. Anyone outside the drawn
     // coverage area is another event's crowd, and showing them would make the
     // dots disagree with every number beside them.
-    const { covered } = filterToCoverage(devices, s.venue);
+    //
+    // Only pay for the point-in-polygon sweep when there are more devices than we
+    // will draw anyway — below the dot cap every covered device is drawn, and the
+    // aggregate above has already told us how many that is. This was running a
+    // second full coverage test over the entire crowd on every single tick.
+    const needsFilter = (totals.coverageDefined && devices.length > MAX_DOTS) || totals.outsideCoverage > 0;
+    const covered = needsFilter ? filterToCoverage(devices, s.venue).covered : devices;
 
     // Crowd objects, not points: the client uses these to merge dots into one
     // labelled blob as people pack together, and the agent reasons about them by
@@ -79,7 +109,16 @@ async function tick(eventId) {
     const { clusters, events: clusterEvents } = advanceClusters(eventId, cells, (c) => cellAreaM2(c.h3));
 
     // Tier 1: decorate zones with risk/forecast/state and detect escalations.
-    const { zones: riskZones, transitions } = predictorAdvance(eventId, zones, { stepSeconds: TICK_MS / 1000 });
+    //
+    // The REAL elapsed time matters, not the nominal tick. Under a heavy crowd a
+    // pass can take many seconds and the overrun guard drops frames, so claiming
+    // "1 second passed" made the forecaster's slope — and therefore every
+    // time-to-critical — badly wrong, and stretched the state machine's sustained
+    // -breach window from 3 seconds to half a minute. That is why a venue could be
+    // visibly packed while the alert feed still read "all zones nominal".
+    const elapsedS = s.lastTickAt ? Math.min(30, Math.max(0.2, (startedAt - s.lastTickAt) / 1000)) : TICK_MS / 1000;
+    s.lastTickAt = startedAt;
+    const { zones: riskZones, transitions } = predictorAdvance(eventId, zones, { stepSeconds: elapsedS });
 
     // Live danger pockets: tight polygons around genuinely dense cells, computed
     // every tick with no LLM in the loop. This is the always-on "danger zone"
@@ -176,6 +215,18 @@ async function tick(eventId) {
   } catch (err) {
     // A bad tick should never kill the loop.
     console.error(`[broadcaster] tick failed for ${eventId}:`, err.message);
+  } finally {
+    s.ticking = false;
+    // Say it out loud when the loop is falling behind, rather than letting the
+    // server quietly degrade until the API stops answering.
+    const took = Date.now() - startedAt;
+    if (took > SLOW_TICK_MS && Date.now() - s.slowSince > SLOW_LOG_EVERY_MS) {
+      s.slowSince = Date.now();
+      console.warn(
+        `[broadcaster] slow tick for ${eventId}: ${took}ms (>${SLOW_TICK_MS}ms) — ` +
+          "frames will be dropped to keep the API responsive; reduce the simulated crowd size"
+      );
+    }
   }
 }
 

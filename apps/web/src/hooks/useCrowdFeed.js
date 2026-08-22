@@ -6,6 +6,7 @@ const MAX_ALERTS = 20;
 const MAX_AGENT_ACTIONS = 12;
 const MAX_BROADCASTS = 10;
 const MAX_CLUSTER_EVENTS = 20;
+const MAX_ALERTED_AREAS = 12;
 
 /** Stable empty array so derived values keep a steady identity for useMemo deps. */
 const NO_CLUSTERS = [];
@@ -82,6 +83,16 @@ export function useCrowdFeed(eventId) {
   const [clusterEvents, setClusterEvents] = useState([]);
   const [status, setStatus] = useState("connecting");
   const [trackedId, setTrackedId] = useState(eventId);
+  /**
+   * The agent's pulse and the ground it has warned.
+   *
+   * `agentStatus` answers "is the guardian alive and what is it doing"; without it
+   * the operator could only infer the agent's health from whether a proposal
+   * happened to show up. `alertedAreas` carries the polygons of every autonomous
+   * targeted alert so the map can plant a flag on the exact ground warned.
+   */
+  const [agentStatus, setAgentStatus] = useState(null);
+  const [alertedAreas, setAlertedAreas] = useState([]);
 
   // Reset the feed when the event changes — the React-sanctioned
   // "adjust state during render" pattern (no setState inside the effect).
@@ -92,6 +103,8 @@ export function useCrowdFeed(eventId) {
     setAgentActions([]);
     setBroadcasts([]);
     setClusterEvents([]);
+    setAgentStatus(null);
+    setAlertedAreas([]);
   }
 
   useEffect(() => {
@@ -135,12 +148,32 @@ export function useCrowdFeed(eventId) {
       });
     };
 
+    const onAgentStatus = (s) => {
+      if (!s || String(s.eventId) !== String(eventId)) return;
+      setAgentStatus({ ...s, receivedAt: Date.now() });
+    };
+    // The agent just warned real ground, autonomously. Keep the most recent
+    // areas so the map can flag them; de-duped by area id, newest wins.
+    const onAgentAlerted = (p) => {
+      if (!p?.areas?.length) return;
+      setAlertedAreas((prev) => {
+        const byId = new Map();
+        for (const a of p.areas) {
+          byId.set(a.id, { ...a, message: p.message, severity: p.severity, at: p.at || Date.now() });
+        }
+        for (const a of prev) if (!byId.has(a.id)) byId.set(a.id, a);
+        return [...byId.values()].sort((x, y) => (y.at || 0) - (x.at || 0)).slice(0, MAX_ALERTED_AREAS);
+      });
+    };
+
     socket.on("connect", subscribe);
     socket.on("disconnect", onDisconnect);
     socket.on("crowd:tick", onTick);
     socket.on("alert:new", onAlert);
     socket.on("agent:action", onAgentAction);
     socket.on("agent:broadcast", onBroadcast);
+    socket.on("agent:status", onAgentStatus);
+    socket.on("agent:alerted", onAgentAlerted);
     if (socket.connected) subscribe();
 
     /**
@@ -183,6 +216,8 @@ export function useCrowdFeed(eventId) {
       socket.off("alert:new", onAlert);
       socket.off("agent:action", onAgentAction);
       socket.off("agent:broadcast", onBroadcast);
+      socket.off("agent:status", onAgentStatus);
+      socket.off("agent:alerted", onAgentAlerted);
     };
   }, [eventId]);
 
@@ -191,5 +226,15 @@ export function useCrowdFeed(eventId) {
   // with the dots and cells drawn beside them.
   const clusters = frame?.clusters || NO_CLUSTERS;
 
-  return { frame, clusters, clusterEvents, alerts, agentActions, broadcasts, status };
+  return {
+    frame,
+    clusters,
+    clusterEvents,
+    alerts,
+    agentActions,
+    broadcasts,
+    agentStatus,
+    alertedAreas,
+    status,
+  };
 }

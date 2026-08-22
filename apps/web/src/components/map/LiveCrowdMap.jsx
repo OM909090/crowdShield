@@ -1,5 +1,6 @@
-import { useMemo } from "react";
+import { useMemo, Fragment } from "react";
 import { MapContainer, TileLayer, Polygon, Polyline, Marker, Tooltip } from "react-leaflet";
+import L from "leaflet";
 import "leaflet/dist/leaflet.css";
 import "../../venueMap.css";
 import { MapController, VenuePin, HeatmapLayer, MarkersLayer, RoutesLayer } from "./mapLayers";
@@ -12,6 +13,150 @@ import { riskMeta, riskRank, formatEta } from "../../utils/riskUi";
 
 const DEFAULT_ZOOM = 16;
 const STATUS_COLOR = { Critical: "#ef4444", Moderate: "#f59e0b", Safe: "#22c55e" };
+
+// Agent-drawn danger areas are coloured by the severity the model assigned.
+const FLAG_COLOR = { critical: "#ef4444", high: "#f97316", medium: "#f59e0b", low: "#eab308" };
+
+// Auto danger zones (live dense pockets) share the same severity vocabulary.
+const DANGER_COLOR = { critical: "#ef4444", high: "#f97316", elevated: "#f59e0b" };
+
+// Pulsing halo behind a gate that is being pushed past capacity.
+const GATE_HALO = {
+  overload: L.divIcon({
+    html: '<div class="cs-gate-halo cs-gate-halo--overload"></div>',
+    className: "",
+    iconSize: [54, 54],
+    iconAnchor: [27, 27],
+  }),
+  busy: L.divIcon({
+    html: '<div class="cs-gate-halo cs-gate-halo--busy"></div>',
+    className: "",
+    iconSize: [44, 44],
+    iconAnchor: [22, 22],
+  }),
+};
+
+// A ⚠ pin dropped between two crowds that are closing on each other.
+const convergeIcon = L.divIcon({
+  html: '<div style="font-size:18px;line-height:1;filter:drop-shadow(0 1px 3px rgba(0,0,0,.8))">⚠️</div>',
+  className: "cs-converge-icon",
+  iconSize: [22, 22],
+  iconAnchor: [11, 11],
+});
+
+// A 🚧 pin for a suggested barricade. divIcon (not an image asset) keeps it
+// dependency-free and crisp at any zoom.
+const barricadeIcon = L.divIcon({
+  html: '<div style="font-size:20px;line-height:1;filter:drop-shadow(0 1px 3px rgba(0,0,0,.7))">🚧</div>',
+  className: "cs-barricade-icon",
+  iconSize: [24, 24],
+  iconAnchor: [12, 12],
+});
+
+// "You are here" — the viewer's OWN live position, drawn from their browser GPS
+// (not the anonymised crowd dots), so a citizen who shares location can actually
+// find themselves on the map. A pulsing cyan pin in the marker pane, above every
+// other layer. Inline styles for the visual + Tailwind's animate-ping for the
+// halo, so it never depends on a stylesheet that might not have loaded.
+const youAreHereIcon = L.divIcon({
+  className: "",
+  html:
+    '<div style="position:relative;display:flex;align-items:center;justify-content:center;width:16px;height:16px">' +
+    '<span class="animate-ping" style="position:absolute;width:16px;height:16px;border-radius:9999px;background:#22d3ee;opacity:.55"></span>' +
+    '<span style="position:relative;width:12px;height:12px;border-radius:9999px;background:#22d3ee;border:2px solid #083344;box-shadow:0 0 8px rgba(34,211,238,.95)"></span>' +
+    "</div>",
+  iconSize: [16, 16],
+  iconAnchor: [8, 8],
+});
+
+const isPoint = (p) => Array.isArray(p) && Number.isFinite(Number(p[0])) && Number.isFinite(Number(p[1]));
+
+/**
+ * A 📣 flag planted on ground the agent has WARNED.
+ *
+ * This is the operator's proof of work: without it, an autonomous alert existed
+ * only as a line of text in a side panel, and the authority had no way to see
+ * that the agent was actively managing the crowd — which areas it told to move,
+ * and when. Planted on the very polygon the alert was aimed at.
+ */
+const alertFlagIcon = L.divIcon({
+  className: "",
+  html:
+    '<div style="display:flex;flex-direction:column;align-items:center;filter:drop-shadow(0 2px 4px rgba(0,0,0,.8))">' +
+    '<div style="font-size:19px;line-height:1">📣</div>' +
+    '<div style="margin-top:-2px;width:2px;height:9px;background:#f472b6"></div>' +
+    "</div>",
+  iconSize: [26, 30],
+  iconAnchor: [13, 30],
+});
+
+/**
+ * Where a person has actually called for help.
+ *
+ * An SOS is the only signal on this map that comes from a named human being in
+ * trouble rather than an aggregate, so it gets its own pin: red and pulsing while
+ * nobody has acknowledged it, calmer once the control room has. Density tells you
+ * where a crush might form; this tells you where someone already needs reaching.
+ */
+const INCIDENT_EMOJI = {
+  sos: "🆘",
+  medical: "⛑️",
+  hazard: "⚠️",
+  blocked: "⛔",
+  lost: "🧭",
+  other: "📍",
+};
+const incidentIconCache = new Map();
+function incidentIcon(category, status) {
+  const key = `${category}:${status}`;
+  if (incidentIconCache.has(key)) return incidentIconCache.get(key);
+  const open = status === "open";
+  const ring = open ? "#ef4444" : status === "acknowledged" ? "#f59e0b" : "#22c55e";
+  const icon = L.divIcon({
+    className: "",
+    html:
+      `<div style="position:relative;display:flex;align-items:center;justify-content:center;width:30px;height:30px">` +
+      (open
+        ? `<span class="animate-ping" style="position:absolute;width:30px;height:30px;border-radius:9999px;background:${ring};opacity:.45"></span>`
+        : "") +
+      `<span style="position:relative;display:flex;align-items:center;justify-content:center;width:26px;height:26px;border-radius:9999px;` +
+      `background:rgba(2,6,23,.92);border:2px solid ${ring};box-shadow:0 0 10px ${ring}99;font-size:13px">` +
+      `${INCIDENT_EMOJI[category] || INCIDENT_EMOJI.other}</span></div>`,
+    iconSize: [30, 30],
+    iconAnchor: [15, 15],
+    popupAnchor: [0, -16],
+  });
+  incidentIconCache.set(key, icon);
+  return icon;
+}
+
+/** What the agent is asking the authority to physically place, by kind. */
+const PLACEMENT_META = {
+  marshals: { emoji: "🧍", label: "Deploy marshals" },
+  medical_tent: { emoji: "⛑️", label: "Place medical tent" },
+  barricade: { emoji: "🚧", label: "Place barricade" },
+  water_point: { emoji: "💧", label: "Place water point" },
+  exit_signage: { emoji: "🪧", label: "Place exit signage" },
+};
+const placementMeta = (kind) => PLACEMENT_META[kind] || { emoji: "📌", label: "Place asset" };
+
+const placementIconCache = new Map();
+function placementIcon(kind) {
+  if (placementIconCache.has(kind)) return placementIconCache.get(kind);
+  const meta = placementMeta(kind);
+  const icon = L.divIcon({
+    className: "",
+    html:
+      '<div style="display:flex;align-items:center;justify-content:center;width:30px;height:30px;border-radius:9999px;' +
+      'background:rgba(2,6,23,.9);border:2px dashed #fbbf24;box-shadow:0 0 10px rgba(251,191,36,.5);font-size:15px">' +
+      `${meta.emoji}</div>`,
+    iconSize: [30, 30],
+    iconAnchor: [15, 15],
+    popupAnchor: [0, -16],
+  });
+  placementIconCache.set(kind, icon);
+  return icon;
+}
 
 /**
  * LiveCrowdMap — the read-only command view: the authority's venue graph with
@@ -32,6 +177,7 @@ const STATUS_COLOR = { Critical: "#ef4444", Moderate: "#f59e0b", Safe: "#22c55e"
  *   markers               annotation markers (optional)
  *   highlightZones        AI-flagged zones [{ zoneId, zoneName, polygon }] (optional)
  *   agentRoutes           AI-drawn paths [{ id, positions, label, type }] (optional)
+ *   youAreAt              the viewer's own [lat,lng] (optional) — "You are here" pin
  */
 export default function LiveCrowdMap({
   center,
@@ -48,6 +194,17 @@ export default function LiveCrowdMap({
   markers = [],
   highlightZones = [],
   agentRoutes = [],
+  flaggedAreas = [],
+  barricades = [],
+  dangerZones = [],
+  gateLoads = [],
+  youAreAt = null,
+  // Ground the agent has actually WARNED (autonomous targeted alerts), and the
+  // assets it is asking the authority to place.
+  alertedAreas = [],
+  placements = [],
+  // People who have called for help (SOS / medical / hazard reports).
+  incidents = [],
   // Opt-in: some consumers (the shared LiveMap) already draw their own legend,
   // and two legends stacked in the same corner is worse than none. Off by
   // default so only a caller that lacks one — the command center — turns it on.
@@ -109,6 +266,39 @@ export default function LiveCrowdMap({
     return ranked[0] || null;
   }, [liveZones]);
 
+  // Crowd groups closing on each other — the crush geometry. The tracker emits
+  // the pair ids; we resolve them to live centroids so the line follows the
+  // crowds as they move, and re-draws gone once they merge or separate.
+  const convergingPairs = useMemo(() => {
+    if (!clusterEvents?.length || !clusters?.length) return [];
+    const byId = new Map();
+    clusters.forEach((k) => {
+      if (Array.isArray(k?.c) && Number.isFinite(k.c[0])) byId.set(String(k.id), k.c);
+    });
+    const out = [];
+    for (const e of clusterEvents) {
+      if (e?.kind !== "converging" || !Array.isArray(e.clusterIds)) continue;
+      const a = byId.get(String(e.clusterIds[0]));
+      const b = byId.get(String(e.clusterIds[1]));
+      if (!a || !b) continue;
+      out.push({
+        id: e.clusterIds.join("~"),
+        a,
+        b,
+        mid: [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2],
+        gapM: e.gapM,
+        bothDense: !!e.bothDense,
+      });
+    }
+    return out;
+  }, [clusters, clusterEvents]);
+
+  const gateLoadById = useMemo(() => {
+    const m = new Map();
+    gateLoads.forEach((g) => m.set(String(g.id), g));
+    return m;
+  }, [gateLoads]);
+
   const hotspotEta = hotspot ? formatEta(hotspot.forecast?.etaCriticalSec) : null;
   const hotspotUrgent =
     hotspot && (hotspot.riskLevel === "HIGH" || hotspot.riskLevel === "CRITICAL");
@@ -125,8 +315,39 @@ export default function LiveCrowdMap({
       />
       <MapController center={center} boundsPoints={boundsPoints} autoFit />
 
-      {/* Area of Responsibility */}
-      {aor.length >= 3 && <Polygon positions={aor} pathOptions={{ ...aorStyle, interactive: false }} />}
+      {/* Area of Responsibility.
+          When no zones have been authored, the boundary IS the zone being scored,
+          so it takes on that risk colour — otherwise the operator would see a
+          risk percentage in the stats with nothing on the map to point at. */}
+      {aor.length >= 3 &&
+        (() => {
+          const implicit = liveZones.find((z) => z.id === "AOR" || z.implicit);
+          const style = implicit?.riskLevel
+            ? {
+                ...aorStyle,
+                color: riskMeta(implicit.riskLevel).color,
+                fillColor: riskMeta(implicit.riskLevel).color,
+                fillOpacity: 0.06 + 0.18 * (implicit.risk || 0),
+                weight: riskRank(implicit.riskLevel) >= riskRank("HIGH") ? 3 : 2,
+              }
+            : aorStyle;
+          return (
+            <Polygon positions={aor} pathOptions={{ ...style, interactive: !!implicit }}>
+              {implicit && (
+                <Tooltip sticky>
+                  <span className="text-xs">
+                    <b>{implicit.name || "Whole venue"}</b>
+                    {` · ${riskMeta(implicit.riskLevel).label} · worst pocket ${implicit.density} p/m²`}
+                    {implicit.meanDensity != null ? ` · venue average ${implicit.meanDensity} p/m²` : ""}
+                    {implicit.forecast?.etaCriticalSec != null
+                      ? ` · critical in ~${formatEta(implicit.forecast.etaCriticalSec)}`
+                      : ""}
+                  </span>
+                </Tooltip>
+              )}
+            </Polygon>
+          );
+        })()}
 
       {/* Zones tinted by live RISK level (falls back to density status) */}
       {zones.map((z) => {
@@ -163,6 +384,29 @@ export default function LiveCrowdMap({
         );
       })}
 
+      {/* Live danger zones — tight polygons around dense pockets, recomputed
+          every tick with no LLM in the loop. Multiple, sized to the actual
+          crowd. This is the always-on "danger area" layer. */}
+      {dangerZones.map((d) =>
+        d.polygon?.length >= 3 ? (
+          <Polygon
+            key={d.id}
+            positions={d.polygon}
+            pathOptions={{
+              color: DANGER_COLOR[d.severity] || DANGER_COLOR.high,
+              weight: 2.5,
+              fillColor: DANGER_COLOR[d.severity] || DANGER_COLOR.high,
+              fillOpacity: 0.22,
+              interactive: false,
+            }}
+          >
+            <Tooltip permanent direction="center" className="cs-ai-tooltip">
+              <span className="text-[11px] font-semibold">⚠ ~{(d.personsEst || 0).toLocaleString("en-IN")}</span>
+            </Tooltip>
+          </Polygon>
+        ) : null
+      )}
+
       {/* AI-flagged zones — attention outline drawn over the tinted zones */}
       {resolvedHighlights.map((h) => (
         <Polygon
@@ -176,6 +420,133 @@ export default function LiveCrowdMap({
             <span className="text-[11px] font-semibold">AI flagged · {h.zoneName || h.zoneId}</span>
           </Tooltip>
         </Polygon>
+      ))}
+
+      {/* AI-drawn danger areas (flag_area) — risk the agent marked itself where
+          no zone was authored. Filled, so it reads as an area, not just an outline. */}
+      {flaggedAreas.map((f) =>
+        f.polygon?.length >= 3 ? (
+          <Polygon
+            key={f.id}
+            positions={f.polygon}
+            pathOptions={{
+              color: FLAG_COLOR[f.severity] || FLAG_COLOR.high,
+              weight: 3,
+              dashArray: "6 6",
+              fillColor: FLAG_COLOR[f.severity] || FLAG_COLOR.high,
+              fillOpacity: 0.18,
+              interactive: false,
+            }}
+          >
+            <Tooltip permanent direction="center" className="cs-ai-tooltip">
+              <span className="text-[11px] font-semibold">⚠ {f.label}</span>
+            </Tooltip>
+          </Polygon>
+        ) : null
+      )}
+
+      {/* AREAS THE AGENT HAS WARNED. A bright outline plus a 📣 flag on each
+          polygon the agent sent a targeted alert to, so the authority can see at
+          a glance that the guardian is actively moving people out of danger —
+          which ground, what it said, and how long ago. */}
+      {alertedAreas.map((a) => (
+        <Fragment key={`alerted-${a.id}`}>
+          {a.polygon?.length >= 3 && (
+            <Polygon
+              positions={a.polygon}
+              pathOptions={{
+                color: "#f472b6",
+                weight: 3,
+                dashArray: "2 6",
+                fillColor: "#f472b6",
+                fillOpacity: 0.1,
+                interactive: false,
+              }}
+            />
+          )}
+          {isPoint(a.center) && (
+            <Marker position={a.center} icon={alertFlagIcon} zIndexOffset={900} interactive>
+              <Tooltip direction="top" offset={[0, -28]}>
+                <span className="text-xs">
+                  <b>Agent alerted this area</b>
+                  {a.name ? <span className="block text-slate-300">{a.name}</span> : null}
+                  {a.message ? <span className="block max-w-[240px]">“{a.message}”</span> : null}
+                  {a.ago ? <span className="block text-slate-400">{a.ago}</span> : null}
+                </span>
+              </Tooltip>
+            </Marker>
+          )}
+        </Fragment>
+      ))}
+
+      {/* WHAT THE AGENT WANTS PLACED. A dashed amber pin the operator can act on:
+          marshals, a medical tent, water, signage — at a point the server
+          resolved from a real crowd/gate/zone, never from model-invented coords. */}
+      {placements.map((p) =>
+        isPoint(p.at) ? (
+          <Marker key={`place-${p.id}`} position={p.at} icon={placementIcon(p.kind)} zIndexOffset={800} interactive>
+            <Tooltip direction="top" offset={[0, -18]}>
+              <span className="text-xs">
+                <b>{placementMeta(p.kind).label}</b>
+                {p.targetName ? <span className="block text-slate-300">at {p.targetName}</span> : null}
+                {p.reason ? <span className="block max-w-[240px] text-slate-300">{p.reason}</span> : null}
+                <span className="mt-0.5 block text-amber-300">AI suggestion — needs you to place it</span>
+              </span>
+            </Tooltip>
+          </Marker>
+        ) : null
+      )}
+
+      {/* SOS / incident reports — a real person asking for help, at the spot they
+          reported from. Pulsing red until the control room acknowledges it. */}
+      {incidents.map((i) =>
+        isPoint(i.at) ? (
+          <Marker
+            key={`incident-${i.id}`}
+            position={i.at}
+            icon={incidentIcon(i.category, i.status)}
+            zIndexOffset={1000}
+            interactive
+          >
+            <Tooltip direction="top" offset={[0, -16]}>
+              <span className="text-xs">
+                <b>
+                  {INCIDENT_EMOJI[i.category] || INCIDENT_EMOJI.other} {String(i.category || "report").toUpperCase()}
+                </b>
+                <span className="block text-slate-300">{i.status}</span>
+                {i.note ? <span className="block max-w-[240px]">{i.note}</span> : null}
+              </span>
+            </Tooltip>
+          </Marker>
+        ) : null
+      )}
+
+      {/* Crowd groups converging — a dashed connector + a ⚠ pin between two
+          bodies of people closing on each other, so a crush approaching from any
+          side is visible live, not just in the side panel. Red when both are
+          already dense. */}
+      {convergingPairs.map((c) => (
+        <Fragment key={`conv-${c.id}`}>
+          <Polyline
+            positions={[c.a, c.b]}
+            pathOptions={{
+              color: c.bothDense ? "#ef4444" : "#f97316",
+              weight: 3,
+              dashArray: "4 8",
+              opacity: 0.9,
+              interactive: false,
+            }}
+          />
+          <Marker position={c.mid} icon={convergeIcon} interactive>
+            <Tooltip direction="top" offset={[0, -10]}>
+              <span className="text-xs">
+                <b>Crowds converging</b>
+                {Number.isFinite(c.gapM) ? ` · ${c.gapM} m apart` : ""}
+                {c.bothDense ? " · both dense" : ""}
+              </span>
+            </Tooltip>
+          </Marker>
+        </Fragment>
       ))}
 
       {/* Corridors */}
@@ -192,18 +563,58 @@ export default function LiveCrowdMap({
       {/* Annotation markers (optional context) */}
       <MarkersLayer markers={markers} editable={false} />
 
+      {/* Gate overload — a pulsing halo behind a gate being pushed past what it
+          can pass. Rendered before the node markers so the gate icon sits on top. */}
+      {gateLoads.map((g) =>
+        (g.level === "overload" || g.level === "busy") && Array.isArray(g.at) ? (
+          <Marker key={`gate-halo-${g.id}`} position={g.at} icon={GATE_HALO[g.level]} interactive={false} zIndexOffset={-100} />
+        ) : null
+      )}
+
       {/* Graph nodes (gates, POIs…) — non-interactive labels */}
-      {nodes.map((n) => (
-        <Marker key={n.id} position={n.at} icon={nodeIcon(n.type, n.state)} interactive>
-          <Tooltip direction="top" offset={[0, -14]}>{`${nodeMeta(n.type).label}: ${n.name || n.id}`}</Tooltip>
-        </Marker>
-      ))}
+      {nodes.map((n) => {
+        const gl = n.type === "gate" ? gateLoadById.get(String(n.id)) : null;
+        const overload = gl && (gl.level === "overload" || gl.level === "busy");
+        return (
+          <Marker key={n.id} position={n.at} icon={nodeIcon(n.type, n.state)} interactive>
+            <Tooltip direction="top" offset={[0, -14]}>
+              {`${nodeMeta(n.type).label}: ${n.name || n.id}`}
+              {overload ? ` · ${gl.level} (~${gl.nearPersons} waiting · ${gl.clearMin} min)` : ""}
+            </Tooltip>
+          </Marker>
+        );
+      })}
+
+      {/* Suggested barricades (suggest_barricade) — where the agent recommends a
+          physical barrier. A human places it; this just pins the spot + reason. */}
+      {barricades.map((b) =>
+        Array.isArray(b.at) && b.at.length >= 2 ? (
+          <Marker key={b.id} position={b.at} icon={barricadeIcon} interactive>
+            <Tooltip direction="top" offset={[0, -12]}>
+              <span className="text-xs">
+                <b>Suggested barricade</b>
+                {b.label ? ` · ${b.label}` : ""}
+                {b.reason ? <span className="block text-slate-300">{b.reason}</span> : null}
+              </span>
+            </Tooltip>
+          </Marker>
+        ) : null
+      )}
 
       {/* Live people dots (canvas, interpolated) — only those not inside a bubble */}
       <DotsLayer dots={loneDots} />
 
       {/* Packed crowds as single merged bubbles (canvas, interpolated + merge animation) */}
       <ClustersLayer clusters={bubbles} clusterEvents={clusterEvents} />
+
+      {/* The viewer's own live location (top of everything) */}
+      {isPoint(youAreAt) && (
+        <Marker position={youAreAt} icon={youAreHereIcon} zIndexOffset={1200} interactive>
+          <Tooltip direction="top" offset={[0, -8]} permanent>
+            <span className="text-xs font-semibold">You are here</span>
+          </Tooltip>
+        </Marker>
+      )}
 
       <VenuePin center={center} venue={venue} />
     </MapContainer>
