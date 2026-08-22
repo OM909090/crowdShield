@@ -25,14 +25,17 @@ export const signupValidator = [
 
   body("role").optional().isIn(["citizen", "authority"]).withMessage("Role must be citizen or authority"),
 
-  body("organizationId")
-    .if(body("role").equals("authority"))
-    .trim()
-    .notEmpty()
-    .withMessage("Organization / Badge ID is required for authority accounts"),
+  // Optional free-text organisation/department label. Authority accounts are
+  // now verified by the uploaded ID document (enforced in the controller as a
+  // multipart file), not by this field, so it is no longer required here.
+  body("organizationId").optional({ nullable: true }).trim().isLength({ max: 120 }),
 
+  // Location can arrive nested (JSON signups) or flat (multipart signups). Both
+  // are optional at the validator layer; the controller enforces presence.
   body("location.latitude").optional({ nullable: true }).isFloat({ min: -90, max: 90 }),
   body("location.longitude").optional({ nullable: true }).isFloat({ min: -180, max: 180 }),
+  body("latitude").optional({ nullable: true }).isFloat({ min: -90, max: 90 }),
+  body("longitude").optional({ nullable: true }).isFloat({ min: -180, max: 180 }),
 ];
 
 export const loginValidator = [

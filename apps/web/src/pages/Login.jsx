@@ -4,8 +4,12 @@ import { ShieldCheck, Eye, EyeOff, ArrowRight, LockKeyhole, Mail, Phone } from "
 import { NavLink, useNavigate } from "react-router-dom";
 import toast from "react-hot-toast";
 import { motion, AnimatePresence } from "framer-motion";
+import { GoogleLogin } from "@react-oauth/google";
 import api from "../utils/axios";
 import { useAuth } from "../context/AuthContext";
+
+// Google Sign-In only renders when a client id is configured (VITE_GOOGLE_CLIENT_ID).
+const googleClientId = import.meta.env.VITE_GOOGLE_CLIENT_ID;
 
 const itemVariants = {
   hidden: { opacity: 0, y: 14 },
@@ -52,6 +56,28 @@ export default function Login() {
       navigate(dest, { replace: true });
     } catch (err) {
       toast.error(err.response?.data?.message || "Login failed");
+    }
+  };
+
+  const handleGoogleSuccess = async (cred) => {
+    try {
+      const res = await api.post("/auth/google", { credential: cred.credential });
+      if (res.data.newUser) {
+        // Google verified the email but there's no account yet — finish signup.
+        navigate("/google/complete", { state: res.data.profile });
+        return;
+      }
+      setUser(res.data.user);
+      toast.success("Logged in with Google");
+      const dest =
+        res.data.user.role === "authority"
+          ? "/authority/events"
+          : res.data.user.role === "admin"
+            ? "/admin/verify-authorities"
+            : "/events";
+      navigate(dest, { replace: true });
+    } catch (err) {
+      toast.error(err.response?.data?.message || "Google sign-in failed");
     }
   };
 
@@ -245,6 +271,25 @@ export default function Login() {
                   {isSubmitting ? "Logging in..." : "Login"}
                   {!isSubmitting && <ArrowRight className="h-4 w-4 transition-transform group-hover:translate-x-1" />}
                 </motion.button>
+
+                {googleClientId && (
+                  <motion.div variants={itemVariants} className="space-y-4">
+                    <div className="flex items-center gap-3">
+                      <span className="h-px flex-1 bg-white/10" />
+                      <span className="text-xs uppercase tracking-widest text-slate-500">or</span>
+                      <span className="h-px flex-1 bg-white/10" />
+                    </div>
+                    <div className="flex justify-center">
+                      <GoogleLogin
+                        onSuccess={handleGoogleSuccess}
+                        onError={() => toast.error("Google sign-in failed")}
+                        theme="filled_black"
+                        shape="pill"
+                        text="continue_with"
+                      />
+                    </div>
+                  </motion.div>
+                )}
 
                 <motion.div variants={itemVariants} className="pt-2 text-center">
                   <NavLink

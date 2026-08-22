@@ -6,7 +6,14 @@ const { Schema } = mongoose;
 const pointSchema = new Schema(
   {
     type: { type: String, enum: ["Point"], default: "Point" },
-    coordinates: { type: [Number], default: undefined }, // [longitude, latitude]
+    coordinates: {
+      type: [Number], // [longitude, latitude]
+      required: [true, "Location coordinates are required"],
+      validate: {
+        validator: (val) => Array.isArray(val) && val.length === 2,
+        message: "Coordinates must be [longitude, latitude]",
+      },
+    },
   },
   { _id: false }
 );
@@ -15,6 +22,29 @@ const refreshTokenSchema = new Schema(
   {
     token: { type: String, required: true }, // stored as SHA-256 hash, never the raw JWT
     createdAt: { type: Date, default: Date.now, expires: "30d" }, // auto-purge stale entries
+  },
+  { _id: false }
+);
+
+const otpSchema = new Schema(
+  {
+    codeHash: { type: String },
+    expiresAt: { type: Date },
+  },
+  { _id: false }
+);
+
+// The government / organisation ID document an authority uploads at signup so an
+// admin can verify they're a real official before granting dashboard access.
+// Only the on-disk filename + metadata live here; the bytes are streamed back
+// through an admin-only endpoint (see auth.controller getAuthorityIdCard).
+const idCardSchema = new Schema(
+  {
+    filename: { type: String },
+    originalName: { type: String },
+    mimeType: { type: String },
+    size: { type: Number },
+    uploadedAt: { type: Date, default: Date.now },
   },
   { _id: false }
 );
@@ -54,19 +84,41 @@ const userSchema = new Schema(
       enum: ["English", "Hindi", "Odia", "Other"],
     },
 
-    password: { type: String, required: true, minlength: 6, select: false },
+    // Optional now — Google accounts have no password. Required for everyone else.
+    password: {
+      type: String,
+      required: [
+        function () {
+          return !this.googleId;
+        },
+        "Password is required",
+      ],
+      minlength: 6,
+      select: false,
+    },
+
+    // Set when an account was created (or linked) via Google Sign-In.
+    // Sparse so multiple docs can have googleId: undefined without violating uniqueness.
+    googleId: { type: String, select: false, unique: true, sparse: true },
 
     // Citizens get instant access; authority accounts are gated behind admin
     // approval before they can publish events. Admins are seeded, not self-signed-up.
     role: { type: String, enum: ["citizen", "authority", "admin"], default: "citizen" },
 
+    // Optional free-text organisation / department label. No longer the thing an
+    // authority is verified by — that's now the uploaded ID document below.
     organizationId: {
       type: String,
       trim: true,
-      required: [function () { return this.role === "authority"; }, "Organization / Badge ID is required for authority accounts"],
+      maxlength: 120,
     },
 
-    // Authority accounts start unverified until an admin/moderator approves them.
+    // Uploaded government/organisation ID for authority accounts. Required for
+    // authority signups is enforced in the controller (multer file presence),
+    // not here, so seeded/legacy authorities without one still validate.
+    idCard: { type: idCardSchema },
+
+    // Authority accounts start unverified until an admin approves them.
     isVerifiedAuthority: {
       type: Boolean,
       default: function () {
@@ -74,7 +126,21 @@ const userSchema = new Schema(
       },
     },
 
-    location: { type: pointSchema },
+    // Email OTP verification, separate from authority approval above.
+    // Google sign-ups skip this (Google has already verified the email).
+    isVerified: {
+      type: Boolean,
+      default: function () {
+        return !!this.googleId;
+      },
+    },
+    otp: { type: otpSchema, select: false },
+
+    // Mandatory at signup — no longer optional.
+    location: {
+      type: pointSchema,
+      required: [true, "Location access is required to create an account"],
+    },
 
     refreshTokens: { type: [refreshTokenSchema], default: [] },
   },
@@ -83,14 +149,15 @@ const userSchema = new Schema(
 
 userSchema.index({ location: "2dsphere" });
 
-// Hash password before persisting, only when it has changed
+// Hash password before persisting, only when it has changed and one exists (Google accounts may have none)
 userSchema.pre("save", async function (next) {
-  if (!this.isModified("password")) return next();
+  if (!this.isModified("password") || !this.password) return next();
   this.password = await bcrypt.hash(this.password, 12);
   next();
 });
 
 userSchema.methods.comparePassword = function (candidatePassword) {
+  if (!this.password) return Promise.resolve(false); // Google-only account, no password to compare
   return bcrypt.compare(candidatePassword, this.password);
 };
 
@@ -99,7 +166,11 @@ userSchema.methods.toSafeObject = function () {
   const obj = this.toObject();
   delete obj.password;
   delete obj.refreshTokens;
+  delete obj.googleId;
+  delete obj.otp;
   delete obj.__v;
+  // idCard filename is an internal on-disk reference; expose only whether one exists
+  if (obj.idCard) obj.idCard = { hasCard: true, uploadedAt: obj.idCard.uploadedAt };
   return obj;
 };
 

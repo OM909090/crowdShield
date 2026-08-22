@@ -60,10 +60,40 @@ const devKillServiceWorker = {
   },
 }
 
+// Where the dev server proxies /api and /socket.io. Defaults to the hosted
+// Render backend so a local authority/citizen session shares ONE origin with
+// the API: the browser sees every request as same-origin (localhost), which
+// (a) sidesteps CORS entirely and (b) keeps the httpOnly auth cookies
+// first-party — they are never dropped as cross-site third-party cookies, which
+// is what breaks a plain local-web -> *.onrender.com login. Point it at a local
+// backend with WEB_PROXY_TARGET=http://localhost:5000.
+const PROXY_TARGET =
+  process.env.WEB_PROXY_TARGET || 'https://crowdshield-api-1qze.onrender.com'
+
 export default defineConfig({
   plugins: [
     devKillServiceWorker,
     react(),
     tailwindcss()
   ],
+  server: {
+    proxy: {
+      // REST API. The `/api` prefix is preserved (the backend mounts routes
+      // under /api), so no rewrite is needed. secure:true because the Render
+      // target is HTTPS with a valid cert.
+      '/api': {
+        target: PROXY_TARGET,
+        changeOrigin: true,
+        secure: true,
+      },
+      // Socket.IO (default path). ws:true forwards the WebSocket upgrade so the
+      // live crowd/alert/broadcast feed streams through the same origin.
+      '/socket.io': {
+        target: PROXY_TARGET,
+        changeOrigin: true,
+        secure: true,
+        ws: true,
+      },
+    },
+  },
 })

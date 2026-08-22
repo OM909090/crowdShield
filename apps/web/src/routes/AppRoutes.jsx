@@ -3,6 +3,10 @@ import { Routes, Route, Navigate } from "react-router-dom";
 import Landing from "../pages/Landing";
 import Login from "../pages/Login";
 import Signup from "../pages/Signup";
+import VerifyOtp from "../pages/VerifyOtp";
+import ForgotPassword from "../pages/ForgotPassword";
+import ResetPassword from "../pages/ResetPassword";
+import GoogleSignupComplete from "../pages/GoogleSignupComplete";
 
 import LiveMap from "../pages/LiveMap";
 import CitizenApp from "../pages/CitizenApp";
@@ -42,6 +46,16 @@ export default function AppRoutes() {
       <Route path="/" element={<Landing />} />
       <Route path="/login" element={<Login />} />
       <Route path="/signup" element={<Signup />} />
+
+      {/* Auth flow: email OTP verification, Google profile completion, and
+          password recovery. These are public (reached mid-signup / mid-reset). */}
+      <Route path="/verify-otp" element={<VerifyOtp />} />
+      {/* Two paths for the same page: /google/complete is what the Google button
+          navigates to, /signup/google is the alias used elsewhere in the app. */}
+      <Route path="/google/complete" element={<GoogleSignupComplete />} />
+      <Route path="/signup/google" element={<GoogleSignupComplete />} />
+      <Route path="/forgot-password" element={<ForgotPassword />} />
+      <Route path="/reset-password" element={<ResetPassword />} />
 
       {/* Legacy: role-aware forward to the real console. */}
       <Route path="/dashboard" element={<DashboardRedirect />} />

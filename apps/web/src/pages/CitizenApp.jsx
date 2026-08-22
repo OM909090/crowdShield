@@ -35,6 +35,8 @@ import {
   X,
   ChevronDown,
   ChevronUp,
+  FlaskConical,
+  Crosshair,
 } from "lucide-react";
 import toast from "react-hot-toast";
 import api from "../utils/axios";
@@ -43,6 +45,12 @@ import { useAssistantSituation } from "../context/assistantSituation";
 import { useCrowdFeed } from "../hooks/useCrowdFeed";
 import { riskMeta, riskRank, severityMeta, formatEta, timeAgo, RISK_LEVELS } from "../utils/riskUi";
 import AlertsFeed from "../components/AlertsFeed";
+import { pointInPolygon, randomPointInPolygon, stepWalker } from "../utils/geoClient";
+
+// Simulated-presence cadence. Matches the real heartbeat interval so the walker
+// moves at the same rate the server samples, and the 15s liveStore TTL never
+// expires it mid-walk.
+const SIM_TICK_MS = 4000;
 import CitizenRouteMap from "../components/map/CitizenRouteMap";
 
 /* ------------------------------------------------------------------ */
@@ -147,6 +155,16 @@ const STRINGS = {
     olderBroadcasts: "Earlier announcements",
     showLabel: "Show",
     hideLabel: "Hide",
+    yourArea: "your area",
+    areaSpecific: "specific area",
+    notYourArea: "Another area",
+    /* --- simulated presence (test harness) --- */
+    simTitle: "Test mode — put me on the map",
+    simBody:
+      "Places you at a random spot inside the coverage area and walks you around. Control room sees you as a live point, and area alerts reach you for real.",
+    simStart: "Simulate my presence",
+    simStop: "Stop simulating",
+    simActive: "On the map — walking",
   },
   hi: {
     tagline: "नागरिक सुरक्षा साथी",
@@ -220,6 +238,15 @@ const STRINGS = {
     olderBroadcasts: "पिछली घोषणाएँ",
     showLabel: "दिखाएँ",
     hideLabel: "छिपाएँ",
+    yourArea: "आपका क्षेत्र",
+    areaSpecific: "विशेष क्षेत्र",
+    notYourArea: "अन्य क्षेत्र",
+    simTitle: "टेस्ट मोड — मुझे नक्शे पर रखें",
+    simBody:
+      "आपको कवरेज क्षेत्र के अंदर एक जगह पर रखता है और घुमाता है। कंट्रोल रूम आपको लाइव पॉइंट के रूप में देखता है।",
+    simStart: "मेरी उपस्थिति सिम्युलेट करें",
+    simStop: "सिम्युलेशन रोकें",
+    simActive: "नक्शे पर — चल रहे हैं",
   },
   or: {
     tagline: "ନାଗରିକ ସୁରକ୍ଷା ସାଥୀ",
@@ -293,6 +320,15 @@ const STRINGS = {
     olderBroadcasts: "ପୂର୍ବ ଘୋଷଣାଗୁଡ଼ିକ",
     showLabel: "ଦେଖାନ୍ତୁ",
     hideLabel: "ଲୁଚାନ୍ତୁ",
+    yourArea: "ଆପଣଙ୍କ ଅଞ୍ଚଳ",
+    areaSpecific: "ନିର୍ଦ୍ଦିଷ୍ଟ ଅଞ୍ଚଳ",
+    notYourArea: "ଅନ୍ୟ ଅଞ୍ଚଳ",
+    simTitle: "ଟେଷ୍ଟ ମୋଡ୍ — ମୋତେ ମ୍ୟାପରେ ରଖନ୍ତୁ",
+    simBody:
+      "ଆପଣଙ୍କୁ କଭରେଜ ଅଞ୍ଚଳ ଭିତରେ ଏକ ସ୍ଥାନରେ ରଖି ଚାଲାଏ। କଣ୍ଟ୍ରୋଲ ରୁମ ଆପଣଙ୍କୁ ଲାଇଭ୍ ପଏଣ୍ଟ ଭାବରେ ଦେଖେ।",
+    simStart: "ମୋ ଉପସ୍ଥିତି ସିମୁଲେଟ୍ କରନ୍ତୁ",
+    simStop: "ସିମୁଲେଶନ୍ ବନ୍ଦ କରନ୍ତୁ",
+    simActive: "ମ୍ୟାପରେ — ଚାଲୁଛି",
   },
 };
 
@@ -443,6 +479,16 @@ export default function CitizenApp() {
   const [reportNote, setReportNote] = useState("");
   const [reportBusy, setReportBusy] = useState(false);
 
+  // ---- Simulated presence (test harness) ----
+  // Puts this account on the map as a live point inside the coverage area and
+  // walks it around, so alerts/announcements can be exercised end-to-end without
+  // physically being at the venue. It feeds the SAME /ingest path a real phone
+  // uses, so the authority sees it as an ordinary live dot — nothing about the
+  // pipeline is faked, only the GPS source.
+  const [simEnabled, setSimEnabled] = useState(false);
+  const [simPos, setSimPos] = useState(null); // { lat, lng, heading, speed }
+  const simRef = useRef(null);
+
   const seenAlerts = useRef(new Set());
   const seenBroadcasts = useRef(new Set());
 
@@ -531,6 +577,67 @@ export default function CitizenApp() {
       clearInterval(interval);
     };
   }, [sharing, eventId]);
+
+  /* ---- simulated presence: walk a synthetic position inside the coverage area ----
+     Only runs when explicitly switched on. It reuses the real heartbeat endpoint
+     so the authority map, the aggregator, the zone rollups and the alert
+     targeting all treat it exactly like a phone that is really there — which is
+     the point: a test that bypassed the pipeline would prove nothing. */
+  useEffect(() => {
+    if (!simEnabled || !eventId) return undefined;
+
+    // Prefer the guarded area; fall back to any authored zone, then the event pin.
+    const aor = venue?.aor?.polygon || [];
+    const zoneRing = venue?.zones?.find((z) => z.polygon?.length >= 3)?.polygon || [];
+    const ring = aor.length >= 3 ? aor : zoneRing;
+
+    let start = ring.length >= 3 ? randomPointInPolygon(ring) : null;
+    if (!start) {
+      // No polygon drawn yet — start at the event's own coordinates so the point
+      // still lands somewhere meaningful rather than at [0,0].
+      const c = selectedEvent?.location?.coordinates?.coordinates;
+      start = Array.isArray(c) && c.length >= 2 ? [Number(c[1]), Number(c[0])] : null;
+    }
+    if (!start || !Number.isFinite(start[0])) {
+      toast.error("No coverage area or event location to place you in yet");
+      setSimEnabled(false);
+      return undefined;
+    }
+
+    simRef.current = { lat: start[0], lng: start[1], heading: Math.random() * 360, speed: 1.3 };
+    setSimPos({ ...simRef.current });
+
+    const hash = getDeviceHash();
+
+    const tick = () => {
+      const next = stepWalker(simRef.current, ring, {
+        speedMps: 1.3,
+        dtSec: SIM_TICK_MS / 1000,
+      });
+      simRef.current = next;
+      setSimPos({ ...next });
+
+      api
+        .post(`/events/${eventId}/ingest`, {
+          heartbeats: [
+            {
+              deviceHash: hash,
+              lat: next.lat,
+              lng: next.lng,
+              heading: next.heading,
+              speed: next.speed,
+            },
+          ],
+        })
+        .catch(() => {
+          /* quiet: a dropped heartbeat every 4s shouldn't spam the tester */
+        });
+    };
+
+    tick(); // report immediately so the dot appears without a 4s wait
+    const interval = setInterval(tick, SIM_TICK_MS);
+    return () => clearInterval(interval);
+  }, [simEnabled, eventId, venue, selectedEvent]);
 
   /* ---- fetch venue destinations for the goal picker ---- */
   useEffect(() => {
@@ -629,19 +736,9 @@ export default function CitizenApp() {
     }
   }, [alerts]);
 
-  /* ---- toast each freshly-pushed broadcast once, in the chosen language ----
-     Driven by the socket list only (not the merged one) so a late joiner isn't
-     hit with a burst of toasts for history they've already missed. */
-  useEffect(() => {
-    for (const b of broadcasts) {
-      if (!b?.id || seenBroadcasts.current.has(b.id)) continue;
-      seenBroadcasts.current.add(b.id);
-      toast(b.messages?.[lang] ?? b.message, {
-        icon: broadcastTone(b.severity).toast,
-        duration: b.severity === "critical" ? 9000 : 6000,
-      });
-    }
-  }, [broadcasts, lang]);
+  /* The broadcast toast lives further down, after the zone-targeting memos it
+     needs — a zone-addressed announcement must not toast someone standing
+     somewhere else. */
 
   /* ---- derived: worst zone drives the headline situation ---- */
   const worst = useMemo(() => {
@@ -653,23 +750,69 @@ export default function CitizenApp() {
   const personsEst =
     frame?.totals?.personsEst != null ? Number(frame.totals.personsEst).toLocaleString("en-IN") : "—";
 
-  /* ---- announcements: live pushes first, then seeded history, de-duped ---- */
+  /* ---- where this person is, however they're reporting it ----
+     A simulated walker counts as a position for targeting purposes: the whole
+     point of the test harness is to exercise the real delivery path. */
+  const myPosition = useMemo(() => {
+    if (simEnabled && simPos && Number.isFinite(simPos.lat)) return [simPos.lat, simPos.lng];
+    if (sharing && coords && Number.isFinite(coords.lat)) return [coords.lat, coords.lng];
+    return null;
+  }, [simEnabled, simPos, sharing, coords]);
+
+  /** The authored zones this person is currently standing in (ids). */
+  const myZoneIds = useMemo(() => {
+    if (!myPosition) return [];
+    return (venue?.zones || [])
+      .filter((z) => z.polygon?.length >= 3 && pointInPolygon(myPosition, z.polygon))
+      .map((z) => z.id);
+  }, [myPosition, venue]);
+
+  /* ---- announcements: live pushes first, then seeded history, de-duped ----
+     Zone targeting is applied here. An announcement with no `zoneIds` is public
+     and reaches everyone. One addressed to specific zones is only "mine" when I
+     am standing in one of them.
+
+     When my position is unknown, a zone-targeted warning is still shown rather
+     than hidden. Suppressing "the corridor you may be in is about to become
+     dangerous" because we can't confirm someone's location would be the worst
+     possible failure for a safety tool — so it surfaces, flagged as
+     area-specific, and the person judges for themselves. */
   const announcements = useMemo(() => {
     const byId = new Map();
     for (const b of [...broadcasts, ...seedBroadcasts]) {
       if (!b) continue;
       const id = b.id || `${b.createdAt}|${b.message}`;
-      if (!byId.has(id)) byId.set(id, { ...b, id });
+      if (byId.has(id)) continue;
+
+      const targets = Array.isArray(b.zoneIds) ? b.zoneIds.filter(Boolean) : [];
+      const scoped = targets.length > 0;
+      const inTarget = scoped && myZoneIds.some((z) => targets.includes(z));
+      const positionKnown = !!myPosition;
+
+      byId.set(id, {
+        ...b,
+        id,
+        scoped,
+        inTarget,
+        // Addressed to areas, but we can't tell whether this is one of mine.
+        uncertain: scoped && !positionKnown,
+        // Definitely not for me: I know where I am, and it isn't there.
+        notForMe: scoped && positionKnown && !inTarget,
+        targetNames: scoped
+          ? targets.map((tid) => (venue?.zones || []).find((z) => z.id === tid)?.name || tid)
+          : [],
+      });
     }
     return [...byId.values()]
       .sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0))
-      .slice(0, 5);
-  }, [broadcasts, seedBroadcasts]);
+      .slice(0, 6);
+  }, [broadcasts, seedBroadcasts, myZoneIds, myPosition, venue]);
 
-  // The newest one the citizen hasn't acknowledged gets the big banner; the rest
-  // stay available in a collapsed list so nothing silently disappears.
+  // The newest un-acknowledged announcement that actually applies here gets the
+  // big banner; the rest stay in the collapsed list so nothing silently
+  // disappears — including ones addressed to other areas.
   const activeBroadcast = useMemo(
-    () => announcements.find((b) => !ackedIds.includes(b.id)) || null,
+    () => announcements.find((b) => !ackedIds.includes(b.id) && !b.notForMe) || null,
     [announcements, ackedIds]
   );
   const olderBroadcasts = useMemo(
@@ -677,18 +820,46 @@ export default function CitizenApp() {
     [announcements, activeBroadcast]
   );
 
+  /* ---- toast each freshly-pushed announcement once, in the chosen language ----
+     Only the ones that arrived over the socket are toasted (a late joiner
+     shouldn't be hit with a burst for history they missed), and only when the
+     announcement actually applies here — a warning addressed to the North
+     Corridor must not interrupt someone standing at the South Gate. */
+  const socketBroadcastIds = useMemo(
+    () => new Set(broadcasts.map((b) => b?.id).filter(Boolean)),
+    [broadcasts]
+  );
+
+  useEffect(() => {
+    for (const b of announcements) {
+      if (!b?.id || !socketBroadcastIds.has(b.id)) continue;
+      if (seenBroadcasts.current.has(b.id)) continue;
+      seenBroadcasts.current.add(b.id);
+      if (b.notForMe) continue; // addressed to an area this person isn't in
+      const scope = b.scoped
+        ? ` · ${b.uncertain ? t("areaSpecific") : t("yourArea")}`
+        : "";
+      toast(`${b.messages?.[lang] ?? b.message}${scope}`, {
+        icon: broadcastTone(b.severity).toast,
+        duration: b.severity === "critical" ? 9000 : 6000,
+      });
+    }
+  }, [announcements, socketBroadcastIds, lang, t]);
+
   /* ---- map centre: own fix → event coords → AoR centroid → nothing ---- */
   const mapCenter = useMemo(() => {
-    if (coords && Number.isFinite(coords.lat) && Number.isFinite(coords.lng)) return [coords.lat, coords.lng];
+    // `myPosition` already prefers the simulated walker over a real fix, so the
+    // map follows whichever one is actually reporting.
+    if (myPosition) return myPosition;
     // Event geometry is GeoJSON [lng, lat]; Leaflet wants [lat, lng].
     const c = selectedEvent?.location?.coordinates?.coordinates;
     if (Array.isArray(c) && c.length >= 2 && Number.isFinite(Number(c[0])) && Number.isFinite(Number(c[1]))) {
       return [Number(c[1]), Number(c[0])];
     }
     return polygonCentroid(venue?.aor?.polygon);
-  }, [coords, selectedEvent, venue]);
+  }, [myPosition, selectedEvent, venue]);
 
-  const youAreAt = coords ? [coords.lat, coords.lng] : null;
+  const youAreAt = myPosition;
 
   // Guidance route — the thing the app has been receiving and discarding.
   const guidanceRoute = useMemo(() => {
@@ -732,6 +903,11 @@ export default function CitizenApp() {
     setShowOlder(false);
     setReportCat(null);
     setReportNote("");
+    // Changing event must stop the walker too, or it would keep reporting a
+    // position into an event the person has left.
+    setSimEnabled(false);
+    setSimPos(null);
+    simRef.current = null;
     seenAlerts.current = new Set();
     seenBroadcasts.current = new Set();
   };
@@ -1145,6 +1321,22 @@ export default function CitizenApp() {
                                   {b.source === "agent" ? <Bot size={9} /> : <ShieldCheck size={9} />}
                                   {b.source === "agent" ? t("fromAgent") : t("fromAuthority")}
                                 </span>
+                                {b.scoped && (
+                                  <span
+                                    className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[9px] font-semibold uppercase tracking-wider ${
+                                      b.notForMe
+                                        ? "border-white/10 bg-white/[0.03] text-slate-400"
+                                        : "border-cyan-400/30 bg-cyan-400/10 text-cyan-200"
+                                    }`}
+                                  >
+                                    <MapPin size={9} />
+                                    {b.notForMe
+                                      ? t("notYourArea")
+                                      : b.targetNames?.length
+                                        ? b.targetNames.join(", ")
+                                        : t("areaSpecific")}
+                                  </span>
+                                )}
                                 <span className="ml-auto shrink-0 text-[10px] text-slate-500">{timeAgo(b.createdAt)}</span>
                               </div>
                               <p className="mt-1.5 text-xs leading-5 text-slate-200">{b.messages?.[lang] ?? b.message}</p>
@@ -1224,6 +1416,54 @@ export default function CitizenApp() {
                   )}
                 </div>
                 <AlertsFeed alerts={alerts} />
+              </div>
+
+              {/* Simulated presence — the honest way to test alert delivery.
+                  It drives the SAME /ingest → aggregate → zone-rollup pipeline a
+                  real phone does, so the control room sees an ordinary live
+                  point and zone-targeted announcements match for real. */}
+              <div className={CARD}>
+                <p className="flex items-center gap-2 text-sm font-semibold">
+                  <FlaskConical size={15} className="text-fuchsia-300" />
+                  {t("simTitle")}
+                </p>
+                <p className="mt-2 text-xs leading-5 text-slate-400">{t("simBody")}</p>
+
+                <button
+                  type="button"
+                  onClick={() => setSimEnabled((v) => !v)}
+                  className={`mt-3 flex w-full items-center justify-center gap-2 rounded-2xl border px-4 py-3 text-sm font-semibold transition ${
+                    simEnabled
+                      ? "border-fuchsia-400/40 bg-fuchsia-500/15 text-fuchsia-100 hover:bg-fuchsia-500/25"
+                      : "border-cyan-400/25 bg-cyan-400/10 text-cyan-200 hover:bg-cyan-400/15"
+                  }`}
+                >
+                  {simEnabled ? <X size={15} /> : <Crosshair size={15} />}
+                  {simEnabled ? t("simStop") : t("simStart")}
+                </button>
+
+                {simEnabled && simPos && (
+                  <div className="mt-3 flex items-center gap-2 rounded-xl border border-fuchsia-400/25 bg-fuchsia-500/10 px-3 py-2">
+                    <span className="relative flex h-2 w-2 shrink-0">
+                      <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-fuchsia-400 opacity-70" />
+                      <span className="relative inline-flex h-2 w-2 rounded-full bg-fuchsia-400" />
+                    </span>
+                    <p className="text-[11px] text-fuchsia-100">
+                      {t("simActive")} · {simPos.lat.toFixed(5)}, {simPos.lng.toFixed(5)}
+                    </p>
+                  </div>
+                )}
+
+                {simEnabled && myZoneIds.length > 0 && (
+                  <p className="mt-2 text-[11px] text-slate-400">
+                    {t("yourArea")}:{" "}
+                    <span className="font-semibold text-cyan-200">
+                      {myZoneIds
+                        .map((zid) => (venue?.zones || []).find((z) => z.id === zid)?.name || zid)
+                        .join(", ")}
+                    </span>
+                  </p>
+                )}
               </div>
 
               {/* Goal picker + guidance */}
@@ -1581,6 +1821,13 @@ function BroadcastBanner({ broadcast, lang, t, onAck }) {
   const Icon = tone.icon;
   const text = broadcast.messages?.[lang] ?? broadcast.message;
   const fromAgent = broadcast.source === "agent";
+  // Zone-addressed announcements say which areas they cover, so a person can
+  // tell "this is about where I'm standing" from "this is about over there".
+  const scopeLabel = broadcast.scoped
+    ? broadcast.targetNames?.length
+      ? broadcast.targetNames.join(", ")
+      : t("areaSpecific")
+    : null;
 
   return (
     <motion.div
@@ -1621,6 +1868,12 @@ function BroadcastBanner({ broadcast, lang, t, onAck }) {
               {fromAgent ? <Bot size={9} /> : <ShieldCheck size={9} />}
               {fromAgent ? t("fromAgent") : t("fromAuthority")}
             </span>
+            {scopeLabel && (
+              <span className="inline-flex items-center gap-1 rounded-full border border-white/25 bg-black/25 px-2 py-0.5 text-[9px] font-semibold uppercase tracking-wider">
+                <MapPin size={9} />
+                {scopeLabel}
+              </span>
+            )}
             <span className="ml-auto shrink-0 text-[10px] opacity-70">{timeAgo(broadcast.createdAt)}</span>
           </div>
 

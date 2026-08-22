@@ -1,34 +1,36 @@
 import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
-import {Toaster} from "react-hot-toast";
+import { Toaster } from "react-hot-toast";
+import { GoogleOAuthProvider } from "@react-oauth/google";
 import "leaflet/dist/leaflet.css";
 
-import {
-BrowserRouter
-} from "react-router-dom";
-
+import { BrowserRouter } from "react-router-dom";
 
 import './index.css'
 import App from './App.jsx'
 
+// Google Sign-In is optional. Only when a client id is configured do we mount
+// the provider — without one it just logs errors and the button can't work, so
+// we omit it entirely and email/password signup + login are unaffected.
+const googleClientId = import.meta.env.VITE_GOOGLE_CLIENT_ID;
 
-createRoot(
-document.getElementById('root')
-)
-.render(
+function Providers({ children }) {
+  return googleClientId ? (
+    <GoogleOAuthProvider clientId={googleClientId}>{children}</GoogleOAuthProvider>
+  ) : (
+    children
+  );
+}
 
-<StrictMode>
-
-<BrowserRouter>
-
-<Toaster/>
-
-<App/>
-
-</BrowserRouter>
-
-</StrictMode>
-
+createRoot(document.getElementById('root')).render(
+  <StrictMode>
+    <Providers>
+      <BrowserRouter>
+        <Toaster />
+        <App />
+      </BrowserRouter>
+    </Providers>
+  </StrictMode>
 )
 
 // ---------------------------------------------------------------------------
